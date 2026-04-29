@@ -71,6 +71,40 @@ create table if not exists agent_goals (
 create index if not exists idx_agent_goals_active
     on agent_goals (goal_key, created_at desc) where active = true;
 
+-- Pre-approved automation rules.
+-- auto_execute=false → agent only NOTIFIES when condition fires.
+-- auto_execute=true  → agent EXECUTES the action (and notifies before/after).
+create table if not exists agent_rules (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    chat_id text,
+    name text not null,
+    description text not null,
+    rule_kind text not null,
+    params jsonb not null,
+    auto_execute boolean not null default false,
+    active boolean not null default true,
+    last_evaluated_at timestamptz,
+    last_triggered_at timestamptz,
+    trigger_count int not null default 0
+);
+
+create index if not exists idx_agent_rules_active
+    on agent_rules (active) where active = true;
+
+-- Log of daily briefings + recaps sent.
+create table if not exists agent_briefings (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    briefing_kind text not null check (briefing_kind in ('morning','recap','rule_alert')),
+    chat_id text not null,
+    content text not null,
+    triggered_rule_ids bigint[]
+);
+
+create index if not exists idx_agent_briefings_recent
+    on agent_briefings (chat_id, created_at desc);
+
 -- Audit log for every write action the bot performs.
 create table if not exists agent_actions (
     id bigserial primary key,

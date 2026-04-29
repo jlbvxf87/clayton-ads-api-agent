@@ -7,7 +7,9 @@
   "scripts": {
     "start": "tsx agents/bot.ts",
     "bot": "tsx agents/bot.ts",
-    "sync": "tsx agents/sync.ts"
+    "sync": "tsx agents/sync.ts",
+    "briefing": "tsx agents/briefing.ts morning",
+    "recap": "tsx agents/briefing.ts recap"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.0",

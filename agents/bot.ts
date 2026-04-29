@@ -30,6 +30,11 @@ import {
   loadActiveGoals,
   setGoal,
 } from './memory.js';
+import {
+  loadActiveRules,
+  createRule,
+  setRuleActive,
+} from './rules.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -779,6 +784,36 @@ const AGENT_TOOLS: Anthropic.Tool[] = [
       required: ['goal_key', 'goal_value'],
     },
   },
+  {
+    name: 'list_rules',
+    description: "List all currently active automation rules with their kind, params, and auto_execute flag.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'create_rule',
+    description:
+      "Create a pre-approved automation rule. Use when the user says 'auto-pause if X' or 'alert me when Y'. Default auto_execute to false (notify-only) unless the user is explicit about wanting the action taken automatically.\n\nSupported rule_kind values:\n- 'pause_high_cpl': params {cpl_threshold_dollars, min_spend_dollars?, window?: 'today'|'yesterday'|'last_7d'} — fires when a campaign's CPL over the window exceeds the threshold.\n- 'pause_zero_leads': params {min_spend_dollars, window?: 'today'|'yesterday'} — fires when an ACTIVE campaign has spent above min_spend with 0 leads.\n- 'cap_daily_spend': params {cap_dollars} — fires when total today's spend exceeds the cap. Notify-only in v1.\n- 'alert_anomaly': params {kind: 'spend_spike'|'cpl_spike', factor} — fires when today's spend or CPL is `factor`× the trailing-7 baseline.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Short label, e.g. "Auto-pause CPL > 3x baseline"' },
+        description: { type: 'string', description: 'Human-readable rule description' },
+        rule_kind: { type: 'string', enum: ['pause_high_cpl', 'pause_zero_leads', 'cap_daily_spend', 'alert_anomaly'] },
+        params: { type: 'object', description: 'Rule-kind-specific parameters' },
+        auto_execute: { type: 'boolean', description: 'If true, execute the action automatically. If false (default), only notify.' },
+      },
+      required: ['name', 'description', 'rule_kind', 'params'],
+    },
+  },
+  {
+    name: 'disable_rule',
+    description: "Disable a rule by ID. Use list_rules first to find the ID. The rule is preserved (active=false) so it can be re-enabled later.",
+    input_schema: {
+      type: 'object',
+      properties: { rule_id: { type: 'integer', description: 'The rule ID' } },
+      required: ['rule_id'],
+    },
+  },
 ];
 
 async function dispatchTool(
@@ -866,6 +901,33 @@ async function dispatchTool(
     case 'set_goal': {
       await setGoal(input.goal_key as string, input.goal_value as string, chatId);
       return { saved: true };
+    }
+    case 'list_rules': {
+      const rules = await loadActiveRules();
+      return rules.map((r) => ({
+        id: r.id,
+        name: r.name,
+        description: r.description,
+        rule_kind: r.rule_kind,
+        params: r.params,
+        auto_execute: r.auto_execute,
+        trigger_count: r.trigger_count,
+      }));
+    }
+    case 'create_rule': {
+      const id = await createRule({
+        chatId,
+        name: input.name as string,
+        description: input.description as string,
+        rule_kind: input.rule_kind as string,
+        params: (input.params as Record<string, unknown>) ?? {},
+        auto_execute: (input.auto_execute as boolean) ?? false,
+      });
+      return { saved: id != null, id };
+    }
+    case 'disable_rule': {
+      await setRuleActive(input.rule_id as number, false);
+      return { disabled: true };
     }
     default:
       throw new Error(`unknown tool: ${name}`);

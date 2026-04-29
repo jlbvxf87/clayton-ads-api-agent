@@ -1,16 +1,21 @@
-name: hourly-sync
+name: daily-recap
+
+# Runs once a day, ~6pm PT. Snapshots campaign state, evaluates rules, and
+# DMs each whitelisted user an end-of-day recap.
+#
+# 01:00 UTC next day = 6pm PDT (Mar–Nov), 5pm PST (Nov–Mar).
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 1 * * *'
   workflow_dispatch: {}
 
 concurrency:
-  group: sync
+  group: recap
   cancel-in-progress: false
 
 jobs:
-  sync:
+  recap:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -22,13 +27,15 @@ jobs:
 
       - name: Verify required secrets are set
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
           META_AD_ACCOUNT: ${{ secrets.META_AD_ACCOUNT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           missing=""
-          for v in META_ACCESS_TOKEN META_AD_ACCOUNT SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+          for v in ANTHROPIC_API_KEY META_ACCESS_TOKEN META_AD_ACCOUNT TELEGRAM_BOT_TOKEN SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
             value="${!v}"
             if [ -z "$value" ]; then
               missing="$missing $v"
@@ -37,18 +44,19 @@ jobs:
             fi
           done
           if [ -n "$missing" ]; then
-            echo ""
             echo "::error::Missing required GitHub secrets:$missing"
-            echo "Add them at: https://github.com/jlbvxf87/Claya-Facebook-agent/settings/secrets/actions"
             exit 1
           fi
-          echo ""
-          echo "All 4 required secrets are present."
 
       - run: npm ci
-      - run: npm run sync
+      - run: npm run recap
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
           META_AD_ACCOUNT: ${{ secrets.META_AD_ACCOUNT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL || 'claude-opus-4-7' }}
+          ACCOUNT_TZ: ${{ secrets.ACCOUNT_TZ || 'America/Los_Angeles' }}
+          BRIEFING_CHAT_IDS: ${{ secrets.BRIEFING_CHAT_IDS }}
