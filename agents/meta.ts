@@ -41,6 +41,59 @@ export interface CampaignInsight {
   actions?: Array<{ action_type: string; value: string }>;
 }
 
+export interface AdSet {
+  id: string;
+  name: string;
+  status: string;
+  effective_status?: string;
+  campaign_id?: string;
+  daily_budget?: string;
+  lifetime_budget?: string;
+  optimization_goal?: string;
+  billing_event?: string;
+  bid_strategy?: string;
+  targeting?: Record<string, unknown>;
+}
+
+export interface Ad {
+  id: string;
+  name: string;
+  status: string;
+  effective_status?: string;
+  adset_id?: string;
+  campaign_id?: string;
+  creative?: AdCreative;
+  preview_shareable_link?: string;
+}
+
+export interface AdCreative {
+  id?: string;
+  name?: string;
+  title?: string;
+  body?: string;
+  image_url?: string;
+  thumbnail_url?: string;
+  video_id?: string;
+  object_type?: string;
+  call_to_action_type?: string;
+  effective_object_story_id?: string;
+}
+
+export interface AdInsight {
+  ad_id?: string;
+  adset_id?: string;
+  ad_name?: string;
+  adset_name?: string;
+  spend: string;
+  impressions?: string;
+  clicks?: string;
+  ctr?: string;
+  cpc?: string;
+  cpm?: string;
+  frequency?: string;
+  actions?: Array<{ action_type: string; value: string }>;
+}
+
 const CAMPAIGN_FIELDS = [
   'id',
   'name',
@@ -153,4 +206,102 @@ export async function setDailyBudget(campaignId: string, dailyBudgetCents: numbe
     params: { daily_budget: String(dailyBudgetCents) },
   });
   return data;
+}
+
+// ---------- Ad set / ad / creative drill-downs ----------
+
+const ADSET_FIELDS = [
+  'id',
+  'name',
+  'status',
+  'effective_status',
+  'campaign_id',
+  'daily_budget',
+  'lifetime_budget',
+  'optimization_goal',
+  'billing_event',
+  'bid_strategy',
+].join(',');
+
+const AD_FIELDS = [
+  'id',
+  'name',
+  'status',
+  'effective_status',
+  'adset_id',
+  'campaign_id',
+  'preview_shareable_link',
+  'creative{id,name,title,body,image_url,thumbnail_url,video_id,object_type,call_to_action_type,effective_object_story_id}',
+].join(',');
+
+const AD_INSIGHT_FIELDS_AD = [
+  'ad_id',
+  'ad_name',
+  'spend',
+  'impressions',
+  'clicks',
+  'ctr',
+  'cpc',
+  'cpm',
+  'frequency',
+  'actions',
+].join(',');
+
+const AD_INSIGHT_FIELDS_ADSET = [
+  'adset_id',
+  'adset_name',
+  'spend',
+  'impressions',
+  'clicks',
+  'ctr',
+  'cpc',
+  'cpm',
+  'frequency',
+  'actions',
+].join(',');
+
+export async function listAdSets(parentId?: string): Promise<AdSet[]> {
+  // parentId may be a campaign id (drill from campaign) or omitted (account-wide)
+  const path = parentId ? `/${parentId}/adsets` : `/${AD_ACCOUNT}/adsets`;
+  return paginated<AdSet>(path, { fields: ADSET_FIELDS, limit: '200' });
+}
+
+export async function listAds(parentId?: string): Promise<Ad[]> {
+  // parentId may be a campaign or ad set id (drill from either) or omitted (account-wide)
+  const path = parentId ? `/${parentId}/ads` : `/${AD_ACCOUNT}/ads`;
+  return paginated<Ad>(path, { fields: AD_FIELDS, limit: '200' });
+}
+
+export async function getAd(adId: string): Promise<Ad> {
+  const { data } = await meta.get(`/${adId}`, { params: { fields: AD_FIELDS } });
+  return data as Ad;
+}
+
+export async function getAdSet(adSetId: string): Promise<AdSet> {
+  const { data } = await meta.get(`/${adSetId}`, { params: { fields: ADSET_FIELDS } });
+  return data as AdSet;
+}
+
+export async function getAdSetInsights(
+  parentId: string,
+  datePreset: DatePreset,
+): Promise<AdInsight[]> {
+  return paginated<AdInsight>(`/${parentId}/insights`, {
+    fields: AD_INSIGHT_FIELDS_ADSET,
+    level: 'adset',
+    date_preset: datePreset,
+    limit: '500',
+  });
+}
+
+export async function getAdInsights(
+  parentId: string,
+  datePreset: DatePreset,
+): Promise<AdInsight[]> {
+  return paginated<AdInsight>(`/${parentId}/insights`, {
+    fields: AD_INSIGHT_FIELDS_AD,
+    level: 'ad',
+    date_preset: datePreset,
+    limit: '500',
+  });
 }

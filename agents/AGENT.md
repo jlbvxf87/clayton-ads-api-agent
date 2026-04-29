@@ -117,6 +117,9 @@ These rules are absolute. If you find yourself about to violate one, stop and te
 - `/report` — Yesterday's performance: spend, leads, CPL, CTR, CPM by campaign. Benchmark each line against the healthcare table and that campaign's trailing-7 baseline. End with top 1–3 things to watch.
 - `/status` — Every campaign: name, status (ACTIVE/PAUSED), today's spend so far, today's leads, daily budget. Sorted by today's spend desc.
 - `/changes` — Diff the latest Supabase snapshot vs. the snapshot from ~24h ago. Show: status changes, budget changes, new/removed campaigns, ad sets that crossed a CPL threshold. If no snapshot exists 24h back, say so.
+- `/adsets [campaign]` — List ad sets under a campaign (or account-wide if omitted): name, status, optimization goal, daily budget, today's spend + leads. Useful for inspecting structure before launch.
+- `/ads [campaign or ad set]` — List ads under a parent (or account-wide): name, status, creative type, today's performance. Use for QA on a freshly published cohort.
+- `/creative <ad>` — Pull a single ad's creative into Telegram: headline, body copy, CTA, thumbnail/image, preview link. Use to spot-check copy/imagery without opening Ads Manager.
 
 ## Phase 2 commands (write — gated, build only after Phase 1 verified)
 

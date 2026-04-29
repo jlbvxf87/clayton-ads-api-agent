@@ -12,7 +12,15 @@ import {
   extractLeads,
   pauseCampaign,
   setDailyBudget,
+  listAdSets,
+  listAds,
+  getAd,
+  getAdSetInsights,
+  getAdInsights,
   type Campaign,
+  type AdSet,
+  type Ad,
+  type AdInsight,
 } from './meta.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -277,23 +285,170 @@ async function handleChanges(chatId: number): Promise<void> {
   await sendChunked(chatId, lines.join('\n'));
 }
 
-// ---------- Slash commands: writes (build pending) ----------
+// ---------- Slash commands: drill-downs (read-only) ----------
 
-async function findCampaignByQuery(query: string): Promise<Campaign | null> {
-  const list = await listCampaigns();
+function fuzzyFind<T extends { id: string; name: string }>(list: T[], query: string): T | null {
   const q = query.trim().toLowerCase();
   if (!q) return null;
-
-  // exact name or id
   let m = list.find((c) => c.name.toLowerCase() === q || c.id === query.trim());
   if (m) return m;
-  // prefix
   m = list.find((c) => c.name.toLowerCase().startsWith(q));
   if (m) return m;
-  // substring
   m = list.find((c) => c.name.toLowerCase().includes(q));
   return m ?? null;
 }
+
+async function findCampaignByQuery(query: string): Promise<Campaign | null> {
+  return fuzzyFind(await listCampaigns(), query);
+}
+
+async function findAdSetByQuery(query: string): Promise<AdSet | null> {
+  return fuzzyFind(await listAdSets(), query);
+}
+
+async function findAdByQuery(query: string): Promise<Ad | null> {
+  return fuzzyFind(await listAds(), query);
+}
+
+async function handleAdSetsCmd(chatId: number, args: string): Promise<void> {
+  await bot.sendChatAction(chatId, 'typing');
+  let parentId: string | undefined;
+  let parentLabel = 'account-wide';
+
+  if (args.trim()) {
+    const campaign = await findCampaignByQuery(args);
+    if (!campaign) {
+      await bot.sendMessage(chatId, `No campaign matched "${args}".`);
+      return;
+    }
+    parentId = campaign.id;
+    parentLabel = campaign.name;
+  }
+
+  const [adSets, todayInsights] = await Promise.all([
+    listAdSets(parentId),
+    parentId ? getAdSetInsights(parentId, 'today') : Promise.resolve([] as AdInsight[]),
+  ]);
+  const insightById = new Map(todayInsights.map((i) => [i.adset_id ?? '', i] as const));
+
+  if (adSets.length === 0) {
+    await bot.sendMessage(chatId, `No ad sets found under ${parentLabel}.`);
+    return;
+  }
+
+  const lines: string[] = [`Ad sets under ${parentLabel} (${adSets.length}):`, ''];
+  for (const a of adSets.slice(0, 50)) {
+    const ins = insightById.get(a.id);
+    const spend = ins?.spend ? Math.round(Number(ins.spend) * 100) : 0;
+    const leads = ins ? extractLeads(ins as never) : 0;
+    const budget = a.daily_budget
+      ? `${fmtMoney(Number(a.daily_budget))}/day`
+      : a.lifetime_budget
+        ? `${fmtMoney(Number(a.lifetime_budget))} lifetime`
+        : 'CBO (campaign budget)';
+    lines.push(
+      `${a.name}  [${a.effective_status ?? a.status}]`,
+      `  ${a.optimization_goal ?? '-'}  |  ${budget}  |  today ${fmtMoney(spend)}  ${leads}L`,
+      '',
+    );
+  }
+  if (adSets.length > 50) lines.push(`...and ${adSets.length - 50} more.`);
+  await sendChunked(chatId, lines.join('\n'));
+}
+
+async function handleAdsCmd(chatId: number, args: string): Promise<void> {
+  await bot.sendChatAction(chatId, 'typing');
+  let parentId: string | undefined;
+  let parentLabel = 'account-wide';
+
+  if (args.trim()) {
+    // try campaign first, then ad set
+    const campaign = await findCampaignByQuery(args);
+    if (campaign) {
+      parentId = campaign.id;
+      parentLabel = `campaign "${campaign.name}"`;
+    } else {
+      const adSet = await findAdSetByQuery(args);
+      if (adSet) {
+        parentId = adSet.id;
+        parentLabel = `ad set "${adSet.name}"`;
+      } else {
+        await bot.sendMessage(chatId, `No campaign or ad set matched "${args}".`);
+        return;
+      }
+    }
+  }
+
+  const [ads, todayInsights] = await Promise.all([
+    listAds(parentId),
+    parentId ? getAdInsights(parentId, 'today') : Promise.resolve([] as AdInsight[]),
+  ]);
+  const insightByAdId = new Map(todayInsights.map((i) => [i.ad_id ?? '', i] as const));
+
+  if (ads.length === 0) {
+    await bot.sendMessage(chatId, `No ads found under ${parentLabel}.`);
+    return;
+  }
+
+  const lines: string[] = [`Ads under ${parentLabel} (${ads.length}):`, ''];
+  for (const a of ads.slice(0, 60)) {
+    const ins = insightByAdId.get(a.id);
+    const spend = ins?.spend ? Math.round(Number(ins.spend) * 100) : 0;
+    const leads = ins ? extractLeads(ins as never) : 0;
+    const ctr = ins?.ctr ? `${Number(ins.ctr).toFixed(2)}%` : '-';
+    const objType = a.creative?.object_type ?? '-';
+    lines.push(
+      `${a.name}  [${a.effective_status ?? a.status}]`,
+      `  ${objType}  |  today ${fmtMoney(spend)}  ${leads}L  ctr ${ctr}`,
+      '',
+    );
+  }
+  if (ads.length > 60) lines.push(`...and ${ads.length - 60} more.`);
+  await sendChunked(chatId, lines.join('\n'));
+}
+
+async function handleCreativeCmd(chatId: number, args: string): Promise<void> {
+  if (!args.trim()) {
+    await bot.sendMessage(chatId, 'Usage: /creative <ad name or id>');
+    return;
+  }
+  await bot.sendChatAction(chatId, 'typing');
+  const ad = await findAdByQuery(args);
+  if (!ad) {
+    await bot.sendMessage(chatId, `No ad matched "${args}".`);
+    return;
+  }
+  const full = await getAd(ad.id);
+  const c = full.creative;
+
+  const lines: string[] = [
+    `Ad: ${full.name}`,
+    `Status: ${full.effective_status ?? full.status}`,
+    `Type: ${c?.object_type ?? '-'}`,
+    `CTA: ${c?.call_to_action_type ?? '-'}`,
+  ];
+  if (c?.title) lines.push(`Headline: ${c.title}`);
+  if (c?.body) lines.push('', 'Body:', c.body);
+  if (full.preview_shareable_link) lines.push('', `Preview: ${full.preview_shareable_link}`);
+
+  // If we have a thumbnail or image, send the photo + caption
+  const imageUrl = c?.image_url ?? c?.thumbnail_url;
+  if (imageUrl) {
+    try {
+      await bot.sendPhoto(chatId, imageUrl, { caption: lines.slice(0, 4).join('\n') });
+      // Send the body separately so it isn't truncated by Telegram's 1024-char caption limit
+      const rest = lines.slice(4).join('\n');
+      if (rest.trim()) await sendChunked(chatId, rest);
+      return;
+    } catch (err) {
+      // Meta CDN URLs sometimes 403 from Telegram's fetcher — fall back to text
+      lines.push('', `(thumbnail at ${imageUrl})`);
+    }
+  }
+  await sendChunked(chatId, lines.join('\n'));
+}
+
+// ---------- Slash commands: writes (build pending) ----------
 
 async function handlePauseCmd(chatId: number, args: string): Promise<void> {
   if (!args.trim()) {
@@ -637,7 +792,22 @@ bot.on('message', async (msg) => {
         case 'help':
           await bot.sendMessage(
             chatId,
-            'Commands:\n/report — yesterday vs healthcare benchmarks\n/status — live today\n/changes — last 24h diff\n/pause <campaign>\n/budget <campaign> <amount>\n/boost <campaign> <percent>\n\nOr just ask me anything in plain English.',
+            [
+              'Read:',
+              '/status — live today',
+              '/report — yesterday vs benchmarks',
+              '/changes — last 24h diff',
+              '/adsets [campaign] — ad sets in a campaign (omit for account-wide)',
+              '/ads [campaign or ad set] — ads under a parent (omit for account-wide)',
+              '/creative <ad> — pull headline, body, thumbnail, CTA into Telegram',
+              '',
+              'Write (gated, requires confirm reply):',
+              '/pause <campaign>',
+              '/budget <campaign> <amount>',
+              '/boost <campaign> <percent>',
+              '',
+              'Or ask anything in plain English.',
+            ].join('\n'),
           );
           return;
         case 'report':
@@ -648,6 +818,17 @@ bot.on('message', async (msg) => {
           return;
         case 'changes':
           await handleChanges(chatId);
+          return;
+        case 'adsets':
+        case 'adset':
+          await handleAdSetsCmd(chatId, args);
+          return;
+        case 'ads':
+          await handleAdsCmd(chatId, args);
+          return;
+        case 'creative':
+        case 'ad':
+          await handleCreativeCmd(chatId, args);
           return;
         case 'pause':
           await handlePauseCmd(chatId, args);
