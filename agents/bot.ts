@@ -22,6 +22,14 @@ import {
   type Ad,
   type AdInsight,
 } from './meta.js';
+import {
+  loadRecentMessages,
+  recordMessage,
+  loadActiveObservations,
+  noteObservation,
+  loadActiveGoals,
+  setGoal,
+} from './memory.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -672,75 +680,299 @@ async function executePending(
   }
 }
 
-// ---------- Free-form ask Claude ----------
+// ---------- Tools the agent can call (read + light-write) ----------
+
+const AGENT_TOOLS: Anthropic.Tool[] = [
+  {
+    name: 'list_campaigns',
+    description:
+      "List every campaign in the ad account with its current status, objective, daily budget. Call when you need a roster — to find a campaign by approximate name or to scan all of them. Cheap to call.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_campaign_insights',
+    description:
+      "Pull spend / impressions / clicks / CTR / CPM / leads at the campaign level over a chosen window. Use this for 'how did campaign X do' or 'what did we spend yesterday' questions.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        date_preset: {
+          type: 'string',
+          enum: ['today', 'yesterday', 'last_7d', 'last_14d', 'last_30d'],
+          description: 'Time window to pull insights over',
+        },
+      },
+      required: ['date_preset'],
+    },
+  },
+  {
+    name: 'list_ad_sets',
+    description:
+      "List ad sets — under a specific campaign if campaign_id is given, otherwise account-wide. Returns name, status, optimization_goal, daily_budget.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        campaign_id: { type: 'string', description: 'Optional campaign ID to scope under. Omit for account-wide.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'list_ads',
+    description:
+      "List ads — under a specific campaign or ad set if parent_id is given, otherwise account-wide. Returns name, status, creative type/headline, today's perf if any.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        parent_id: { type: 'string', description: 'Optional campaign or ad set ID to scope under.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'get_ad_creative',
+    description:
+      "Pull a single ad's full creative: headline, body copy, CTA, thumbnail URL, video ID, preview link. Use when the user asks about specific ad copy or wants to QA before launch.",
+    input_schema: {
+      type: 'object',
+      properties: { ad_id: { type: 'string', description: 'The ad ID' } },
+      required: ['ad_id'],
+    },
+  },
+  {
+    name: 'get_ad_insights',
+    description:
+      "Pull spend / impressions / leads at the ad level under a parent (campaign or ad set). Use for 'which ad has the best CTR' or 'why is this ad set underperforming' questions.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        parent_id: { type: 'string', description: 'Campaign or ad set ID' },
+        date_preset: { type: 'string', enum: ['today', 'yesterday', 'last_7d', 'last_14d', 'last_30d'] },
+      },
+      required: ['parent_id', 'date_preset'],
+    },
+  },
+  {
+    name: 'note_observation',
+    description:
+      "Save a durable note about the account, the user's preferences, or anything you've learned that future-you should remember. Examples: 'pixel was broken Aug-Oct 2025', 'user prefers we ask before pausing creative', 'campaign X audience is 25-34'. Topic should be a short tag like 'pixel', 'preference', 'campaign:Claya Images'.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string' },
+        observation: { type: 'string' },
+        confidence: { type: 'string', enum: ['low', 'medium', 'high'] },
+      },
+      required: ['topic', 'observation'],
+    },
+  },
+  {
+    name: 'set_goal',
+    description:
+      "Save a goal the user has set, e.g. cpl_target=35, daily_spend_cap=300, weekly_spend_cap=2000. Stored as text. Use when the user says 'our target is X' or 'don't go above $Y/day'.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        goal_key: { type: 'string', description: "Snake-case key, e.g. 'cpl_target', 'daily_spend_cap'" },
+        goal_value: { type: 'string', description: 'The target value as a string (e.g. "35", "300")' },
+      },
+      required: ['goal_key', 'goal_value'],
+    },
+  },
+];
+
+async function dispatchTool(
+  name: string,
+  input: Record<string, unknown>,
+  chatId: number,
+): Promise<unknown> {
+  switch (name) {
+    case 'list_campaigns': {
+      const cs = await listCampaigns();
+      return cs.map((c) => ({
+        id: c.id,
+        name: c.name,
+        status: c.effective_status ?? c.status,
+        objective: c.objective ?? null,
+        daily_budget_dollars: c.daily_budget ? Number(c.daily_budget) / 100 : null,
+      }));
+    }
+    case 'get_campaign_insights': {
+      const dp = (input.date_preset as 'today' | 'yesterday' | 'last_7d' | 'last_14d' | 'last_30d') ?? 'today';
+      const ins = await getCampaignInsights(dp);
+      return ins.map((i) => ({
+        campaign_id: i.campaign_id,
+        campaign_name: i.campaign_name,
+        spend_dollars: Number(i.spend),
+        leads: extractLeads(i),
+        impressions: i.impressions ? Number(i.impressions) : 0,
+        clicks: i.clicks ? Number(i.clicks) : 0,
+        ctr_pct: i.ctr ? Number(i.ctr) : null,
+        cpm_dollars: i.cpm ? Number(i.cpm) : null,
+      }));
+    }
+    case 'list_ad_sets': {
+      const ass = await listAdSets(input.campaign_id as string | undefined);
+      return ass.map((a) => ({
+        id: a.id,
+        name: a.name,
+        status: a.effective_status ?? a.status,
+        campaign_id: a.campaign_id ?? null,
+        optimization_goal: a.optimization_goal ?? null,
+        daily_budget_dollars: a.daily_budget ? Number(a.daily_budget) / 100 : null,
+      }));
+    }
+    case 'list_ads': {
+      const ads = await listAds(input.parent_id as string | undefined);
+      return ads.map((a) => ({
+        id: a.id,
+        name: a.name,
+        status: a.effective_status ?? a.status,
+        campaign_id: a.campaign_id ?? null,
+        adset_id: a.adset_id ?? null,
+        creative_type: a.creative?.object_type ?? null,
+        headline: a.creative?.title ?? null,
+      }));
+    }
+    case 'get_ad_creative': {
+      const ad = await getAd(input.ad_id as string);
+      return {
+        id: ad.id,
+        name: ad.name,
+        status: ad.effective_status ?? ad.status,
+        creative: ad.creative ?? null,
+        preview: ad.preview_shareable_link ?? null,
+      };
+    }
+    case 'get_ad_insights': {
+      const dp = (input.date_preset as 'today' | 'yesterday' | 'last_7d' | 'last_14d' | 'last_30d') ?? 'last_7d';
+      const ins = await getAdInsights(input.parent_id as string, dp);
+      return ins.map((i) => ({
+        ad_id: i.ad_id,
+        ad_name: i.ad_name,
+        spend_dollars: Number(i.spend),
+        leads: extractLeads(i as never),
+        ctr_pct: i.ctr ? Number(i.ctr) : null,
+        cpm_dollars: i.cpm ? Number(i.cpm) : null,
+      }));
+    }
+    case 'note_observation': {
+      const id = await noteObservation(input.topic as string, input.observation as string, {
+        chatId,
+        confidence: input.confidence as 'low' | 'medium' | 'high' | undefined,
+      });
+      return { saved: id != null, id };
+    }
+    case 'set_goal': {
+      await setGoal(input.goal_key as string, input.goal_value as string, chatId);
+      return { saved: true };
+    }
+    default:
+      throw new Error(`unknown tool: ${name}`);
+  }
+}
+
+// ---------- Free-form ask Claude (memory + tool-using agent loop) ----------
 
 async function askClaude(userText: string, chatId: number): Promise<void> {
   await bot.sendChatAction(chatId, 'typing');
 
-  const [campaigns, todayInsights, ydayInsights] = await Promise.all([
-    listCampaigns(),
-    getCampaignInsights('today'),
-    getCampaignInsights('yesterday'),
+  // 1. Persist this user turn immediately so it's part of memory even if the call fails.
+  await recordMessage(chatId, 'user', userText);
+
+  // 2. Pull context: rolling conversation, persistent observations, active goals.
+  const [history, observations, goals] = await Promise.all([
+    loadRecentMessages(chatId),
+    loadActiveObservations(),
+    loadActiveGoals(),
   ]);
-  const todayById = new Map(todayInsights.map((i) => [i.campaign_id, i] as const));
-  const ydayById = new Map(ydayInsights.map((i) => [i.campaign_id, i] as const));
 
-  const liveContext = campaigns.map((c) => {
-    const t = todayById.get(c.id);
-    const y = ydayById.get(c.id);
-    return {
-      id: c.id,
-      name: c.name,
-      status: c.effective_status ?? c.status,
-      objective: c.objective ?? null,
-      daily_budget_dollars: c.daily_budget ? Number(c.daily_budget) / 100 : null,
-      today: t
-        ? {
-            spend_dollars: Number(t.spend),
-            leads: extractLeads(t),
-            ctr_pct: t.ctr ? Number(t.ctr) : null,
-            cpc_dollars: t.cpc ? Number(t.cpc) : null,
-            cpm_dollars: t.cpm ? Number(t.cpm) : null,
-            frequency: t.frequency ? Number(t.frequency) : null,
-          }
-        : null,
-      yesterday: y
-        ? {
-            spend_dollars: Number(y.spend),
-            leads: extractLeads(y),
-            ctr_pct: y.ctr ? Number(y.ctr) : null,
-            cpm_dollars: y.cpm ? Number(y.cpm) : null,
-          }
-        : null,
-    };
-  });
+  // Drop the just-recorded message off the end of history; we'll add it as the live user turn.
+  const priorHistory = history.slice(0, -1);
 
-  const dataBlock = `Live campaign snapshot for ${process.env.META_AD_ACCOUNT}.\n\nCurrent server time (UTC): ${new Date().toISOString()}\nAccount-local timezone: ${ACCOUNT_TZ}\n\nCampaigns (today + yesterday):\n${JSON.stringify(liveContext, null, 2)}`;
+  const sessionContext = [
+    `Current server time (UTC): ${new Date().toISOString()}`,
+    `Account-local timezone: ${ACCOUNT_TZ}`,
+    `Ad account: ${process.env.META_AD_ACCOUNT}`,
+    '',
+    observations.length > 0
+      ? `Persistent observations you've previously saved (most recent first):\n${observations
+          .map((o) => `- [${o.topic}] ${o.observation} (confidence: ${o.confidence ?? 'medium'})`)
+          .join('\n')}`
+      : 'No persistent observations yet.',
+    '',
+    goals.length > 0
+      ? `Active goals the user has set:\n${goals.map((g) => `- ${g.goal_key}: ${g.goal_value}`).join('\n')}`
+      : 'No goals set yet.',
+    '',
+    'You have tools to query the live ad account directly. Call them when you need fresh data — do not assume. Use note_observation to remember anything important for future conversations. Use set_goal when the user states a target.',
+  ].join('\n');
 
-  const response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 1500,
-    system: [
-      {
-        type: 'text',
-        text: AGENT_MD,
-        cache_control: { type: 'ephemeral' },
-      },
-    ],
-    thinking: { type: 'adaptive' },
-    messages: [
-      { role: 'user', content: dataBlock },
-      { role: 'user', content: userText },
-    ],
-  });
+  // 3. Build the message array: rolling history + a session-context turn + the current user turn.
+  const messages: Anthropic.MessageParam[] = [
+    ...priorHistory.map((m) => ({ role: m.role, content: m.content })),
+    { role: 'user', content: `[session context]\n${sessionContext}` },
+    { role: 'user', content: userText },
+  ];
 
-  const out = response.content
-    .filter((b): b is Anthropic.TextBlock => b.type === 'text')
-    .map((b) => b.text)
-    .join('\n')
-    .trim();
+  // 4. Tool-use loop: keep calling Claude until it stops asking for tools.
+  let assistantText = '';
+  const MAX_HOPS = 8;
 
-  await sendChunked(chatId, out);
+  for (let hop = 0; hop < MAX_HOPS; hop++) {
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 1500,
+      system: [{ type: 'text', text: AGENT_MD, cache_control: { type: 'ephemeral' } }],
+      thinking: { type: 'adaptive' },
+      tools: AGENT_TOOLS,
+      messages,
+    });
+
+    // Append the full assistant turn (preserves tool_use blocks for the next iteration).
+    messages.push({ role: 'assistant', content: response.content });
+
+    if (response.stop_reason !== 'tool_use') {
+      assistantText = response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n')
+        .trim();
+      break;
+    }
+
+    // Execute every tool_use in this turn and feed results back.
+    const toolUseBlocks = response.content.filter(
+      (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use',
+    );
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
+    for (const tu of toolUseBlocks) {
+      try {
+        const result = await dispatchTool(tu.name, tu.input as Record<string, unknown>, chatId);
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: tu.id,
+          content: JSON.stringify(result).slice(0, 12_000),
+        });
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: tu.id,
+          content: `error: ${m}`,
+          is_error: true,
+        });
+      }
+    }
+    messages.push({ role: 'user', content: toolResults });
+  }
+
+  if (!assistantText) assistantText = '[no response]';
+
+  // 5. Persist the assistant reply so future turns can see it.
+  await recordMessage(chatId, 'assistant', assistantText);
+
+  await sendChunked(chatId, assistantText);
 }
 
 // ---------- Router ----------

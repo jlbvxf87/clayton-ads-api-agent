@@ -19,6 +19,32 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
+
+      - name: Verify required secrets are set
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT: ${{ secrets.META_AD_ACCOUNT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          missing=""
+          for v in META_ACCESS_TOKEN META_AD_ACCOUNT SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+            value="${!v}"
+            if [ -z "$value" ]; then
+              missing="$missing $v"
+            else
+              echo "  + $v is set (${#value} chars)"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo ""
+            echo "::error::Missing required GitHub secrets:$missing"
+            echo "Add them at: https://github.com/jlbvxf87/Claya-Facebook-agent/settings/secrets/actions"
+            exit 1
+          fi
+          echo ""
+          echo "All 4 required secrets are present."
+
       - run: npm ci
       - run: npm run sync
         env:

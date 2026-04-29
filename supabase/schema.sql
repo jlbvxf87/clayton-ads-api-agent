@@ -30,6 +30,47 @@ create index if not exists idx_campaign_snapshots_lookup
 create index if not exists idx_campaign_snapshots_campaign
     on campaign_snapshots (campaign_id, snapshot_at desc);
 
+-- Per-chat conversation history (rolling memory for free-form Claude calls).
+create table if not exists chat_messages (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    chat_id text not null,
+    role text not null check (role in ('user','assistant')),
+    content text not null
+);
+
+create index if not exists idx_chat_messages_lookup
+    on chat_messages (chat_id, created_at desc);
+
+-- Persistent observations the agent maintains about the account.
+-- Things it learns over time: "Pixel was broken Aug-Oct 2025",
+-- "Claya Images converts at $27 CPL", "user prefers we ask before pausing creative".
+create table if not exists agent_observations (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    chat_id text,
+    topic text not null,           -- short tag like 'pixel', 'pricing', 'preference', 'campaign:Claya Images'
+    observation text not null,     -- the note itself, written by the agent
+    confidence text default 'medium', -- 'low' | 'medium' | 'high'
+    superseded_by bigint references agent_observations(id) on delete set null
+);
+
+create index if not exists idx_agent_observations_topic
+    on agent_observations (topic, created_at desc) where superseded_by is null;
+
+-- Goals the user has set for the account (target CPL, daily cap, etc.).
+create table if not exists agent_goals (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    chat_id text,
+    goal_key text not null,        -- 'cpl_target', 'daily_spend_cap', 'weekly_spend_cap', etc.
+    goal_value text not null,      -- stored as text to keep flexible
+    active boolean not null default true
+);
+
+create index if not exists idx_agent_goals_active
+    on agent_goals (goal_key, created_at desc) where active = true;
+
 -- Audit log for every write action the bot performs.
 create table if not exists agent_actions (
     id bigserial primary key,
