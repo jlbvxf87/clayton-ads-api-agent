@@ -72,16 +72,16 @@ npm run sync
 
 The `Procfile` runs `tsx agents/bot.ts`. Set every `.env` var as a Railway service variable.
 
-### Cron — GitHub Actions
+### Cron — runs inside the bot
 
-`.github/workflows/sync.yml` runs `npm run sync` hourly. In the repo's Settings → Secrets and variables → Actions, add:
+The bot self-schedules via `node-cron`. No GitHub Actions, no second set of secrets — Railway's env vars are the single source of truth.
 
-- `META_ACCESS_TOKEN`
-- `META_AD_ACCOUNT`
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
+- 9:00 AM account-local — morning briefing
+- 6:00 PM account-local — end-of-day recap
 
-The Anthropic key is **not** needed for the cron — `sync.ts` doesn't call Claude.
+To disable cron (e.g. for staging deploys): set `ENABLE_CRON=false` as a Railway variable.
+
+To trigger a briefing on demand from Telegram: `/briefing` or `/recap`.
 
 ## Phase 1 commands (read-only)
 

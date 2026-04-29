@@ -280,7 +280,11 @@ async function snapshotIntoSupabase(rows: CampaignRow[]): Promise<void> {
   if (error) console.warn('snapshot insert failed:', error.message);
 }
 
-async function run(mode: 'morning' | 'recap'): Promise<void> {
+/**
+ * Run a briefing or recap end-to-end: snapshot, evaluate rules,
+ * generate Claude text, deliver to Telegram. Importable from bot.ts.
+ */
+export async function runBriefing(mode: 'morning' | 'recap'): Promise<void> {
   console.log(`Briefing run: mode=${mode} at ${new Date().toISOString()}`);
 
   const snapshot = await gatherSnapshot();
@@ -296,13 +300,17 @@ async function run(mode: 'morning' | 'recap'): Promise<void> {
   console.log(`Briefing run complete. ${triggers.length} rule trigger(s).`);
 }
 
-const mode = (process.argv[2] ?? 'morning') as 'morning' | 'recap';
-if (mode !== 'morning' && mode !== 'recap') {
-  console.error(`Unknown mode: ${mode}. Use 'morning' or 'recap'.`);
-  process.exit(1);
+// Allow direct CLI usage (npm run briefing / npm run recap) without importing.
+// Only run as a CLI when this file is the entry point.
+const isMain = import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  const mode = (process.argv[2] ?? 'morning') as 'morning' | 'recap';
+  if (mode !== 'morning' && mode !== 'recap') {
+    console.error(`Unknown mode: ${mode}. Use 'morning' or 'recap'.`);
+    process.exit(1);
+  }
+  runBriefing(mode).catch((err) => {
+    console.error('Briefing failed:', err);
+    process.exit(1);
+  });
 }
-
-run(mode).catch((err) => {
-  console.error('Briefing failed:', err);
-  process.exit(1);
-});

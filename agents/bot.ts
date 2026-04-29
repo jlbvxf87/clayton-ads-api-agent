@@ -4,6 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import TelegramBot from 'node-telegram-bot-api';
 import Anthropic from '@anthropic-ai/sdk';
+import cron from 'node-cron';
+import { runBriefing } from './briefing.js';
 import { supabase } from './supabase.js';
 import {
   listCampaigns,
@@ -1124,6 +1126,20 @@ bot.on('message', async (msg) => {
         case 'ad':
           await handleCreativeCmd(chatId, args);
           return;
+        case 'briefing':
+        case 'runbriefing':
+          await bot.sendMessage(chatId, 'Running morning briefing now...');
+          runBriefing('morning')
+            .then(() => bot.sendMessage(chatId, 'Briefing run complete.'))
+            .catch((err) => bot.sendMessage(chatId, `Briefing failed: ${err instanceof Error ? err.message : String(err)}`));
+          return;
+        case 'recap':
+        case 'runrecap':
+          await bot.sendMessage(chatId, 'Running end-of-day recap now...');
+          runBriefing('recap')
+            .then(() => bot.sendMessage(chatId, 'Recap run complete.'))
+            .catch((err) => bot.sendMessage(chatId, `Recap failed: ${err instanceof Error ? err.message : String(err)}`));
+          return;
         case 'pause':
           await handlePauseCmd(chatId, args);
           return;
@@ -1150,6 +1166,37 @@ bot.on('message', async (msg) => {
 bot.on('polling_error', (err) => {
   console.error('polling error:', err);
 });
+
+// ---------- Daily cron schedules (in-process) ----------
+// Eliminates the need for GitHub Actions secrets — bot is already on
+// Railway with all env vars. Same Claude/Meta/Supabase/Telegram clients
+// the chat handler already uses. Schedules are in account-local TZ.
+
+const ENABLE_CRON = (process.env.ENABLE_CRON ?? 'true').toLowerCase() !== 'false';
+
+if (ENABLE_CRON) {
+  // 9:00 AM account-local — morning briefing
+  cron.schedule(
+    '0 9 * * *',
+    () => {
+      console.log(`[cron] morning briefing firing at ${new Date().toISOString()}`);
+      runBriefing('morning').catch((err) => console.error('morning briefing failed:', err));
+    },
+    { timezone: ACCOUNT_TZ },
+  );
+
+  // 6:00 PM account-local — end-of-day recap
+  cron.schedule(
+    '0 18 * * *',
+    () => {
+      console.log(`[cron] end-of-day recap firing at ${new Date().toISOString()}`);
+      runBriefing('recap').catch((err) => console.error('recap failed:', err));
+    },
+    { timezone: ACCOUNT_TZ },
+  );
+
+  console.log(`[cron] scheduled morning 9:00 + recap 18:00 in tz=${ACCOUNT_TZ}`);
+}
 
 console.log(
   `Facebook ad agent running. model=${MODEL} account=${process.env.META_AD_ACCOUNT} tz=${ACCOUNT_TZ}`,
