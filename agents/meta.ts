@@ -2,11 +2,30 @@ import 'dotenv/config';
 import axios, { type AxiosInstance } from 'axios';
 
 const ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
-const AD_ACCOUNT = process.env.META_AD_ACCOUNT;
+const AD_ACCOUNT_RAW = process.env.META_AD_ACCOUNT;
 
-if (!ACCESS_TOKEN || !AD_ACCOUNT) {
+if (!ACCESS_TOKEN || !AD_ACCOUNT_RAW) {
   throw new Error('META_ACCESS_TOKEN and META_AD_ACCOUNT must be set');
 }
+
+// Multi-account support — comma-separated list. First entry is the default.
+export const AD_ACCOUNTS: string[] = AD_ACCOUNT_RAW.split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const DEFAULT_AD_ACCOUNT = AD_ACCOUNTS[0];
+
+// Resolve "act_xxx" or short alias to a full ID. If missing, returns default.
+export function resolveAdAccount(accountId?: string): string {
+  if (!accountId) return DEFAULT_AD_ACCOUNT;
+  const trimmed = accountId.trim();
+  if (!trimmed) return DEFAULT_AD_ACCOUNT;
+  const match = AD_ACCOUNTS.find((a) => a === trimmed || a === `act_${trimmed}`);
+  return match ?? DEFAULT_AD_ACCOUNT;
+}
+
+// Backward-compat alias used throughout the file.
+const AD_ACCOUNT = DEFAULT_AD_ACCOUNT;
 
 const META_API_VERSION = 'v21.0';
 const baseURL = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -304,4 +323,417 @@ export async function getAdInsights(
     date_preset: datePreset,
     limit: '500',
   });
+}
+
+// ---------- Creative editing (clone-with-modifications pattern) ----------
+
+interface AdCreativeFull {
+  id: string;
+  name?: string;
+  object_story_spec?: Record<string, unknown>;
+  asset_feed_spec?: Record<string, unknown>;
+  call_to_action_type?: string;
+  title?: string;
+  body?: string;
+  url_tags?: string;
+  link_url?: string;
+  image_hash?: string;
+  video_id?: string;
+  thumbnail_url?: string;
+  template_url?: string;
+  effective_object_story_id?: string;
+}
+
+export async function getCreative(creativeId: string): Promise<AdCreativeFull> {
+  const fields = [
+    'id',
+    'name',
+    'object_story_spec',
+    'asset_feed_spec',
+    'call_to_action_type',
+    'title',
+    'body',
+    'url_tags',
+    'link_url',
+    'image_hash',
+    'video_id',
+    'thumbnail_url',
+    'template_url',
+    'effective_object_story_id',
+  ].join(',');
+  const { data } = await meta.get(`/${creativeId}`, { params: { fields } });
+  return data as AdCreativeFull;
+}
+
+interface CloneAdWithCopyArgs {
+  ad_id: string;
+  new_headline?: string;
+  new_body?: string;
+  new_cta?: string;
+  new_link_url?: string;
+  new_ad_name?: string;
+}
+
+interface CloneAdResult {
+  new_ad_id: string;
+  new_creative_id: string;
+  source_ad_id: string;
+  source_ad_name: string;
+  changes: Record<string, { from: unknown; to: unknown }>;
+}
+
+/**
+ * Clone an existing ad, optionally swapping headline / body / CTA / link url,
+ * and save the result as PAUSED. Original ad is untouched.
+ *
+ * Strategy: fetch the source ad's creative.object_story_spec, clone-with-mutations
+ * into a new creative, then create a new ad pointing at the new creative.
+ */
+export async function cloneAdWithNewCopy(args: CloneAdWithCopyArgs): Promise<CloneAdResult> {
+  // 1. Fetch the source ad with creative
+  const adFields = [
+    'id',
+    'name',
+    'adset_id',
+    'creative{id}',
+  ].join(',');
+  const { data: srcAd } = await meta.get(`/${args.ad_id}`, { params: { fields: adFields } });
+
+  if (!srcAd?.creative?.id) {
+    throw new Error(`Source ad ${args.ad_id} has no creative attached`);
+  }
+
+  // 2. Fetch the full creative
+  const srcCreative = await getCreative(srcAd.creative.id);
+
+  // 3. Build the new creative payload by cloning + modifying object_story_spec
+  // We mutate link_data fields where possible; otherwise fall back to top-level fields.
+  const objectStorySpec: Record<string, unknown> = JSON.parse(
+    JSON.stringify(srcCreative.object_story_spec ?? {}),
+  );
+
+  const changes: Record<string, { from: unknown; to: unknown }> = {};
+
+  const linkData = (objectStorySpec.link_data as Record<string, unknown> | undefined) ?? null;
+  const videoData = (objectStorySpec.video_data as Record<string, unknown> | undefined) ?? null;
+  const target = linkData ?? videoData ?? null;
+
+  if (args.new_headline) {
+    if (target) {
+      changes.headline = { from: target.name ?? srcCreative.title ?? null, to: args.new_headline };
+      target.name = args.new_headline;
+    } else {
+      changes.headline = { from: srcCreative.title ?? null, to: args.new_headline };
+    }
+  }
+  if (args.new_body) {
+    if (target) {
+      changes.body = { from: target.message ?? srcCreative.body ?? null, to: args.new_body };
+      target.message = args.new_body;
+    } else {
+      changes.body = { from: srcCreative.body ?? null, to: args.new_body };
+    }
+  }
+  if (args.new_cta) {
+    const cta = (target?.call_to_action as Record<string, unknown> | undefined) ?? null;
+    changes.cta = { from: cta?.type ?? srcCreative.call_to_action_type ?? null, to: args.new_cta };
+    if (target) {
+      target.call_to_action = { ...(cta ?? {}), type: args.new_cta };
+    }
+  }
+  if (args.new_link_url) {
+    if (target) {
+      changes.link_url = { from: target.link ?? srcCreative.link_url ?? null, to: args.new_link_url };
+      target.link = args.new_link_url;
+    }
+  }
+
+  // 4. Create the new creative
+  const newCreativeName = `${srcCreative.name ?? 'creative'} — edited ${new Date().toISOString().slice(0, 10)}`;
+  const creativePayload: Record<string, unknown> = {
+    name: newCreativeName,
+    object_story_spec: objectStorySpec,
+  };
+  // Preserve top-level fields where useful (Meta accepts both)
+  if (args.new_headline && !linkData && !videoData) creativePayload.title = args.new_headline;
+  if (args.new_body && !linkData && !videoData) creativePayload.body = args.new_body;
+  if (args.new_cta && !linkData && !videoData) creativePayload.call_to_action_type = args.new_cta;
+
+  const { data: newCreative } = await meta.post(
+    `/${AD_ACCOUNT}/adcreatives`,
+    null,
+    { params: creativePayload },
+  );
+  const newCreativeId = newCreative?.id as string;
+  if (!newCreativeId) throw new Error('Failed to create new creative');
+
+  // 5. Create the new ad as PAUSED, attached to the same ad set
+  const newAdName = args.new_ad_name ?? `${srcAd.name} — edited ${new Date().toISOString().slice(0, 10)}`;
+  const adPayload: Record<string, unknown> = {
+    name: newAdName,
+    adset_id: srcAd.adset_id,
+    creative: JSON.stringify({ creative_id: newCreativeId }),
+    status: 'PAUSED',
+  };
+  const { data: newAd } = await meta.post(`/${AD_ACCOUNT}/ads`, null, { params: adPayload });
+  if (!newAd?.id) throw new Error('Failed to create new ad');
+
+  return {
+    new_ad_id: newAd.id,
+    new_creative_id: newCreativeId,
+    source_ad_id: args.ad_id,
+    source_ad_name: srcAd.name,
+    changes,
+  };
+}
+
+// ---------- Campaign / ad set / ad creation (always PAUSED) ----------
+
+interface CreateCampaignArgs {
+  name: string;
+  objective: string;          // e.g. 'OUTCOME_LEADS','OUTCOME_SALES','OUTCOME_TRAFFIC','OUTCOME_AWARENESS','OUTCOME_ENGAGEMENT','OUTCOME_APP_PROMOTION'
+  special_ad_categories?: string[];
+  daily_budget_cents?: number;     // optional CBO daily budget at the campaign level
+  buying_type?: 'AUCTION' | 'RESERVED';
+}
+
+const NEW_BUDGET_CAP_CENTS = 50_000;       // $500/day hard cap on creation
+const NEW_BUDGET_FLOOR_CENTS = 500;        // $5/day floor
+
+export async function createCampaign(args: CreateCampaignArgs): Promise<{ id: string; payload: Record<string, unknown> }> {
+  if (args.daily_budget_cents != null) {
+    if (args.daily_budget_cents < NEW_BUDGET_FLOOR_CENTS)
+      throw new Error(`daily_budget below $${NEW_BUDGET_FLOOR_CENTS / 100} floor`);
+    if (args.daily_budget_cents > NEW_BUDGET_CAP_CENTS)
+      throw new Error(`daily_budget exceeds $${NEW_BUDGET_CAP_CENTS / 100} per-creation cap`);
+  }
+  const payload: Record<string, unknown> = {
+    name: args.name,
+    objective: args.objective,
+    status: 'PAUSED',
+    special_ad_categories: JSON.stringify(args.special_ad_categories ?? []),
+    buying_type: args.buying_type ?? 'AUCTION',
+  };
+  if (args.daily_budget_cents != null) payload.daily_budget = String(args.daily_budget_cents);
+
+  const { data } = await meta.post(`/${AD_ACCOUNT}/campaigns`, null, { params: payload });
+  if (!data?.id) throw new Error('Campaign creation returned no id');
+  return { id: data.id as string, payload };
+}
+
+interface CreateAdSetArgs {
+  campaign_id: string;
+  name: string;
+  daily_budget_cents?: number;
+  optimization_goal: string;       // e.g. 'OFFSITE_CONVERSIONS','LEAD_GENERATION','LINK_CLICKS','REACH'
+  billing_event?: string;          // default 'IMPRESSIONS'
+  bid_strategy?: string;           // 'LOWEST_COST_WITHOUT_CAP','LOWEST_COST_WITH_BID_CAP','COST_CAP'
+  targeting: Record<string, unknown>;
+  start_time?: string;             // ISO; default now
+  promoted_object?: Record<string, unknown>; // for conversion goals: { pixel_id, custom_event_type }
+}
+
+export async function createAdSet(args: CreateAdSetArgs): Promise<{ id: string; payload: Record<string, unknown> }> {
+  if (args.daily_budget_cents != null) {
+    if (args.daily_budget_cents < NEW_BUDGET_FLOOR_CENTS)
+      throw new Error(`daily_budget below $${NEW_BUDGET_FLOOR_CENTS / 100} floor`);
+    if (args.daily_budget_cents > NEW_BUDGET_CAP_CENTS)
+      throw new Error(`daily_budget exceeds $${NEW_BUDGET_CAP_CENTS / 100} per-creation cap`);
+  }
+  const payload: Record<string, unknown> = {
+    name: args.name,
+    campaign_id: args.campaign_id,
+    status: 'PAUSED',
+    optimization_goal: args.optimization_goal,
+    billing_event: args.billing_event ?? 'IMPRESSIONS',
+    bid_strategy: args.bid_strategy ?? 'LOWEST_COST_WITHOUT_CAP',
+    targeting: JSON.stringify(args.targeting),
+  };
+  if (args.daily_budget_cents != null) payload.daily_budget = String(args.daily_budget_cents);
+  if (args.start_time) payload.start_time = args.start_time;
+  if (args.promoted_object) payload.promoted_object = JSON.stringify(args.promoted_object);
+
+  const { data } = await meta.post(`/${AD_ACCOUNT}/adsets`, null, { params: payload });
+  if (!data?.id) throw new Error('Ad set creation returned no id');
+  return { id: data.id as string, payload };
+}
+
+interface CreateAdArgs {
+  adset_id: string;
+  name: string;
+  creative_id: string;
+}
+
+export async function createAd(args: CreateAdArgs): Promise<{ id: string }> {
+  const payload: Record<string, unknown> = {
+    name: args.name,
+    adset_id: args.adset_id,
+    creative: JSON.stringify({ creative_id: args.creative_id }),
+    status: 'PAUSED',
+  };
+  const { data } = await meta.post(`/${AD_ACCOUNT}/ads`, null, { params: payload });
+  if (!data?.id) throw new Error('Ad creation returned no id');
+  return { id: data.id as string };
+}
+
+// ---------- Targeting reads + writes ----------
+
+export async function getAdSetTargeting(adSetId: string): Promise<Record<string, unknown> | null> {
+  const { data } = await meta.get(`/${adSetId}`, { params: { fields: 'targeting' } });
+  return (data?.targeting as Record<string, unknown>) ?? null;
+}
+
+export async function updateAdSetTargeting(
+  adSetId: string,
+  newTargeting: Record<string, unknown>,
+): Promise<unknown> {
+  // Verify the ad set is PAUSED before touching targeting (high-blast-radius write).
+  const { data: current } = await meta.get(`/${adSetId}`, {
+    params: { fields: 'effective_status,status,name' },
+  });
+  const status = (current?.effective_status ?? current?.status) as string;
+  if (status === 'ACTIVE') {
+    throw new Error(
+      `Refusing to modify targeting on ACTIVE ad set "${current?.name ?? adSetId}" (status=${status}). Pause it first.`,
+    );
+  }
+  const { data } = await meta.post(`/${adSetId}`, null, {
+    params: { targeting: JSON.stringify(newTargeting) },
+  });
+  return data;
+}
+
+export interface CustomAudience {
+  id: string;
+  name: string;
+  description?: string;
+  approximate_count?: number;
+  subtype?: string;
+  retention_days?: number;
+}
+
+export async function listCustomAudiences(accountId?: string): Promise<CustomAudience[]> {
+  const acct = resolveAdAccount(accountId);
+  return paginated<CustomAudience>(`/${acct}/customaudiences`, {
+    fields: 'id,name,description,approximate_count,subtype,retention_days',
+    limit: '100',
+  });
+}
+
+export async function createLookalikeAudience(args: {
+  name: string;
+  source_audience_id: string;
+  ratio: number;          // 0.01 (1%) to 0.20 (20%); ratio is decimal
+  country: string;        // e.g. 'US'
+}): Promise<{ id: string }> {
+  if (args.ratio < 0.01 || args.ratio > 0.2) {
+    throw new Error('ratio must be between 0.01 (1%) and 0.20 (20%)');
+  }
+  const lookalikeSpec = {
+    type: 'similarity',
+    ratio: args.ratio,
+    country: args.country,
+  };
+  const { data } = await meta.post(`/${AD_ACCOUNT}/customaudiences`, null, {
+    params: {
+      name: args.name,
+      subtype: 'LOOKALIKE',
+      origin_audience_id: args.source_audience_id,
+      lookalike_spec: JSON.stringify(lookalikeSpec),
+    },
+  });
+  if (!data?.id) throw new Error('Lookalike creation returned no id');
+  return { id: data.id as string };
+}
+
+// ---------- Pixel / Events Manager ----------
+
+export interface AdsPixel {
+  id: string;
+  name: string;
+  code?: string;
+  creation_time?: string;
+  last_fired_time?: string;
+  is_unavailable?: boolean;
+}
+
+export async function listPixels(accountId?: string): Promise<AdsPixel[]> {
+  const acct = resolveAdAccount(accountId);
+  return paginated<AdsPixel>(`/${acct}/adspixels`, {
+    fields: 'id,name,code,creation_time,last_fired_time,is_unavailable',
+    limit: '50',
+  });
+}
+
+export async function getPixel(pixelId: string): Promise<AdsPixel> {
+  const { data } = await meta.get(`/${pixelId}`, {
+    params: { fields: 'id,name,code,creation_time,last_fired_time,is_unavailable' },
+  });
+  return data as AdsPixel;
+}
+
+export interface PixelEventStat {
+  event: string;
+  event_total_count?: number;
+  custom_conversions?: unknown;
+}
+
+export async function getPixelStats(
+  pixelId: string,
+  aggregation: 'event' | 'host' | 'browser_type' | 'pixel_fire' = 'event',
+): Promise<PixelEventStat[]> {
+  const { data } = await meta.get(`/${pixelId}/stats`, {
+    params: { aggregation },
+  });
+  return (data?.data ?? []) as PixelEventStat[];
+}
+
+export interface PixelHealthSummary {
+  pixel_id: string;
+  pixel_name: string;
+  last_fired_time: string | null;
+  is_unavailable: boolean;
+  hours_since_last_fire: number | null;
+  events_seen: Array<{ event: string; count: number }>;
+  diagnosis: string;
+}
+
+export async function getPixelHealth(pixelId?: string): Promise<PixelHealthSummary[]> {
+  const pixels = pixelId ? [await getPixel(pixelId)] : await listPixels();
+  const out: PixelHealthSummary[] = [];
+
+  for (const p of pixels) {
+    let stats: PixelEventStat[] = [];
+    try {
+      stats = await getPixelStats(p.id, 'event');
+    } catch {
+      // some pixels don't expose stats
+    }
+    const lastFired = p.last_fired_time ? new Date(p.last_fired_time) : null;
+    const hoursSince = lastFired
+      ? Math.round((Date.now() - lastFired.getTime()) / 3600000)
+      : null;
+
+    let diagnosis = 'OK';
+    if (p.is_unavailable) diagnosis = 'pixel marked unavailable by Meta';
+    else if (hoursSince == null) diagnosis = 'no last_fired_time on record';
+    else if (hoursSince > 168) diagnosis = `cold — last fired ${hoursSince}h ago (>1 week)`;
+    else if (hoursSince > 48) diagnosis = `warm — last fired ${hoursSince}h ago`;
+    else diagnosis = `live — last fired ${hoursSince}h ago`;
+
+    out.push({
+      pixel_id: p.id,
+      pixel_name: p.name,
+      last_fired_time: p.last_fired_time ?? null,
+      is_unavailable: p.is_unavailable ?? false,
+      hours_since_last_fire: hoursSince,
+      events_seen: stats
+        .map((s) => ({ event: s.event, count: Number(s.event_total_count ?? 0) }))
+        .filter((s) => Number.isFinite(s.count) && s.count > 0)
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 20),
+      diagnosis,
+    });
+  }
+  return out;
 }

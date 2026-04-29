@@ -19,6 +19,17 @@ import {
   getAd,
   getAdSetInsights,
   getAdInsights,
+  listPixels,
+  getPixelHealth,
+  cloneAdWithNewCopy,
+  createCampaign,
+  createAdSet,
+  createAd,
+  getAdSetTargeting,
+  updateAdSetTargeting,
+  listCustomAudiences,
+  createLookalikeAudience,
+  AD_ACCOUNTS,
   type Campaign,
   type AdSet,
   type Ad,
@@ -687,9 +698,18 @@ async function executePending(
   }
 }
 
-// ---------- Tools the agent can call (read + light-write) ----------
+// ---------- Tools the agent can call (read + light-write + server-side) ----------
 
-const AGENT_TOOLS: Anthropic.Tool[] = [
+// Server-side tools execute on Anthropic's infra; no local handler needed.
+// Listed first so they appear before custom tools in the array.
+const SERVER_SIDE_TOOLS: unknown[] = [
+  // Web search — Claude can look up current Meta policy, GLP-1 marketing trends, competitor research, etc.
+  { type: 'web_search_20260209', name: 'web_search' },
+  // Web fetch — pull a specific URL Claude wants to read.
+  { type: 'web_fetch_20260209', name: 'web_fetch' },
+];
+
+const CUSTOM_TOOLS: Anthropic.Tool[] = [
   {
     name: 'list_campaigns',
     description:
@@ -816,6 +836,136 @@ const AGENT_TOOLS: Anthropic.Tool[] = [
       required: ['rule_id'],
     },
   },
+  {
+    name: 'list_pixels',
+    description: "List all Meta Pixels attached to the ad account. Returns name, last_fired_time, is_unavailable. Use when the user asks about tracking, conversions, or the Pixel.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_pixel_health',
+    description: "Audit pixel health: how recently it fired, what events have been recorded, and a one-line diagnosis (live / warm / cold / unavailable). If pixel_id is omitted, audits every pixel on the account. Use when the user asks 'is the Pixel working' or when diagnosing zero-leads situations.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        pixel_id: { type: 'string', description: 'Optional pixel ID. Omit to audit all pixels.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'list_accounts',
+    description: "List the Meta ad account IDs this bot has access to. Useful when multiple accounts are configured.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'clone_ad_with_new_copy',
+    description: "Clone an existing ad with new headline / body / CTA / link URL, save the new ad as PAUSED. The original is untouched. Use for A/B testing copy variants. Always returns the new ad ID so the user can publish from Ads Manager when ready. NEVER touches active ads — the new ad is always paused.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        ad_id: { type: 'string', description: 'Source ad ID to clone from' },
+        new_headline: { type: 'string', description: 'Optional new headline' },
+        new_body: { type: 'string', description: 'Optional new body copy' },
+        new_cta: { type: 'string', description: "Optional new CTA type (e.g. 'LEARN_MORE','BOOK_NOW','SIGN_UP','SHOP_NOW','GET_OFFER')" },
+        new_link_url: { type: 'string', description: 'Optional new landing URL' },
+        new_ad_name: { type: 'string', description: 'Optional name for the new ad' },
+      },
+      required: ['ad_id'],
+    },
+  },
+  {
+    name: 'create_campaign',
+    description: "Create a new campaign — always saved as PAUSED. Use when the user explicitly says 'create' or 'spin up' a campaign. Confirm campaign details with the user before calling. Daily budget hard-capped at $500 per single creation; floor $5.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        objective: {
+          type: 'string',
+          description: "Campaign objective: 'OUTCOME_LEADS','OUTCOME_SALES','OUTCOME_TRAFFIC','OUTCOME_AWARENESS','OUTCOME_ENGAGEMENT','OUTCOME_APP_PROMOTION'",
+        },
+        daily_budget_dollars: { type: 'number', description: 'Optional CBO daily budget at the campaign level' },
+        special_ad_categories: { type: 'array', items: { type: 'string' }, description: "Special ad category codes if applicable, e.g. ['HOUSING','EMPLOYMENT','CREDIT','ISSUES_ELECTIONS_POLITICS']" },
+      },
+      required: ['name', 'objective'],
+    },
+  },
+  {
+    name: 'create_ad_set',
+    description: "Create a new ad set under an existing campaign — always PAUSED. Use after create_campaign. Daily budget hard-capped at $500 per single creation; floor $5. Targeting must be a Meta API targeting object.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        campaign_id: { type: 'string' },
+        name: { type: 'string' },
+        daily_budget_dollars: { type: 'number' },
+        optimization_goal: {
+          type: 'string',
+          description: "e.g. 'OFFSITE_CONVERSIONS','LEAD_GENERATION','LINK_CLICKS','REACH','IMPRESSIONS','POST_ENGAGEMENT','VIDEO_VIEWS'",
+        },
+        billing_event: { type: 'string', description: "Default 'IMPRESSIONS'. Other: 'LINK_CLICKS','PAGE_LIKES','POST_ENGAGEMENT'." },
+        targeting: { type: 'object', description: 'Meta targeting spec — geo_locations, age_min/age_max, interests, custom_audiences, etc.' },
+        promoted_object: {
+          type: 'object',
+          description: "For conversion goals: { pixel_id, custom_event_type } e.g. { pixel_id: '123', custom_event_type: 'LEAD' }",
+        },
+      },
+      required: ['campaign_id', 'name', 'optimization_goal', 'targeting'],
+    },
+  },
+  {
+    name: 'create_ad',
+    description: "Create a new ad under an existing ad set — always PAUSED. Requires a creative_id (use clone_ad_with_new_copy first if you need a new creative).",
+    input_schema: {
+      type: 'object',
+      properties: {
+        adset_id: { type: 'string' },
+        name: { type: 'string' },
+        creative_id: { type: 'string' },
+      },
+      required: ['adset_id', 'name', 'creative_id'],
+    },
+  },
+  {
+    name: 'get_ad_set_targeting',
+    description: "Read the targeting JSON for an ad set. Returns geo_locations, age_min/max, interests, custom_audiences, etc.",
+    input_schema: {
+      type: 'object',
+      properties: { ad_set_id: { type: 'string' } },
+      required: ['ad_set_id'],
+    },
+  },
+  {
+    name: 'update_ad_set_targeting',
+    description: "Replace the targeting on an ad set. **Only works on PAUSED ad sets** — refuses if ACTIVE. Always confirm the new targeting with the user before calling. Pass a complete Meta targeting spec.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        ad_set_id: { type: 'string' },
+        targeting: { type: 'object', description: 'Full Meta targeting spec to replace the existing targeting with' },
+      },
+      required: ['ad_set_id', 'targeting'],
+    },
+  },
+  {
+    name: 'list_custom_audiences',
+    description: "List all custom audiences in the ad account — name, approximate_count, subtype (LOOKALIKE / CUSTOM / WEBSITE / etc).",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'create_lookalike_audience',
+    description: "Create a Lookalike audience from an existing source audience. ratio is 0.01 (1%) to 0.20 (20%). Higher ratio = larger but lower-quality audience. Confirm with user before creating.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        source_audience_id: { type: 'string' },
+        ratio: { type: 'number', description: 'Decimal 0.01 to 0.20' },
+        country: { type: 'string', description: "Country code, e.g. 'US'" },
+      },
+      required: ['name', 'source_audience_id', 'ratio', 'country'],
+    },
+  },
 ];
 
 async function dispatchTool(
@@ -931,8 +1081,127 @@ async function dispatchTool(
       await setRuleActive(input.rule_id as number, false);
       return { disabled: true };
     }
+    case 'list_pixels': {
+      const pixels = await listPixels();
+      return pixels.map((p) => ({
+        id: p.id,
+        name: p.name,
+        last_fired_time: p.last_fired_time ?? null,
+        is_unavailable: p.is_unavailable ?? false,
+      }));
+    }
+    case 'get_pixel_health': {
+      return await getPixelHealth(input.pixel_id as string | undefined);
+    }
+    case 'list_accounts': {
+      return AD_ACCOUNTS.map((id) => ({ id, is_default: id === AD_ACCOUNTS[0] }));
+    }
+    case 'clone_ad_with_new_copy': {
+      const result = await cloneAdWithNewCopy({
+        ad_id: input.ad_id as string,
+        new_headline: input.new_headline as string | undefined,
+        new_body: input.new_body as string | undefined,
+        new_cta: input.new_cta as string | undefined,
+        new_link_url: input.new_link_url as string | undefined,
+        new_ad_name: input.new_ad_name as string | undefined,
+      });
+      await logAgentAction(chatId, 'clone_ad_with_new_copy', result.source_ad_id, result.source_ad_name, result.changes, {
+        new_ad_id: result.new_ad_id,
+        new_creative_id: result.new_creative_id,
+      });
+      return result;
+    }
+    case 'create_campaign': {
+      const dollars = input.daily_budget_dollars as number | undefined;
+      const result = await createCampaign({
+        name: input.name as string,
+        objective: input.objective as string,
+        special_ad_categories: input.special_ad_categories as string[] | undefined,
+        daily_budget_cents: dollars != null ? Math.round(dollars * 100) : undefined,
+      });
+      await logAgentAction(chatId, 'create_campaign', result.id, input.name as string, null, result.payload);
+      return result;
+    }
+    case 'create_ad_set': {
+      const dollars = input.daily_budget_dollars as number | undefined;
+      const result = await createAdSet({
+        campaign_id: input.campaign_id as string,
+        name: input.name as string,
+        daily_budget_cents: dollars != null ? Math.round(dollars * 100) : undefined,
+        optimization_goal: input.optimization_goal as string,
+        billing_event: input.billing_event as string | undefined,
+        targeting: (input.targeting as Record<string, unknown>) ?? {},
+        promoted_object: input.promoted_object as Record<string, unknown> | undefined,
+      });
+      await logAgentAction(chatId, 'create_ad_set', result.id, input.name as string, null, result.payload);
+      return result;
+    }
+    case 'create_ad': {
+      const result = await createAd({
+        adset_id: input.adset_id as string,
+        name: input.name as string,
+        creative_id: input.creative_id as string,
+      });
+      await logAgentAction(chatId, 'create_ad', result.id, input.name as string, null, { creative_id: input.creative_id });
+      return result;
+    }
+    case 'get_ad_set_targeting': {
+      return await getAdSetTargeting(input.ad_set_id as string);
+    }
+    case 'update_ad_set_targeting': {
+      const before = await getAdSetTargeting(input.ad_set_id as string);
+      const resp = await updateAdSetTargeting(
+        input.ad_set_id as string,
+        (input.targeting as Record<string, unknown>) ?? {},
+      );
+      await logAgentAction(chatId, 'update_ad_set_targeting', input.ad_set_id as string, null, before, input.targeting);
+      return resp;
+    }
+    case 'list_custom_audiences': {
+      const aud = await listCustomAudiences();
+      return aud.map((a) => ({
+        id: a.id,
+        name: a.name,
+        approximate_count: a.approximate_count ?? null,
+        subtype: a.subtype ?? null,
+      }));
+    }
+    case 'create_lookalike_audience': {
+      const result = await createLookalikeAudience({
+        name: input.name as string,
+        source_audience_id: input.source_audience_id as string,
+        ratio: input.ratio as number,
+        country: input.country as string,
+      });
+      await logAgentAction(chatId, 'create_lookalike_audience', result.id, input.name as string, null, input);
+      return result;
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
+  }
+}
+
+async function logAgentAction(
+  chatId: number,
+  command: string,
+  targetId: string | null,
+  targetName: string | null,
+  before: unknown,
+  after: unknown,
+): Promise<void> {
+  try {
+    await supabase.from('agent_actions').insert({
+      chat_id: String(chatId),
+      user_handle: 'agent',
+      command,
+      target_campaign_id: targetId,
+      target_campaign_name: targetName,
+      before_state: before as object | null,
+      after_state: after as object | null,
+      success: true,
+    });
+  } catch (err) {
+    console.warn('logAgentAction failed:', err);
   }
 }
 
@@ -989,7 +1258,8 @@ async function askClaude(userText: string, chatId: number): Promise<void> {
       max_tokens: 1500,
       system: [{ type: 'text', text: AGENT_MD, cache_control: { type: 'ephemeral' } }],
       thinking: { type: 'adaptive' },
-      tools: AGENT_TOOLS,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mixing custom + server-side tool types
+      tools: [...SERVER_SIDE_TOOLS, ...CUSTOM_TOOLS] as any,
       messages,
     });
 
@@ -1096,13 +1366,19 @@ bot.on('message', async (msg) => {
               '/adsets [campaign] — ad sets in a campaign (omit for account-wide)',
               '/ads [campaign or ad set] — ads under a parent (omit for account-wide)',
               '/creative <ad> — pull headline, body, thumbnail, CTA into Telegram',
+              '/pixel — Pixel health audit (last fire, events, diagnosis)',
+              '/accounts — list ad accounts this bot has access to',
+              '',
+              'Daily rhythm:',
+              '/briefing — fire morning briefing now',
+              '/recap — fire end-of-day recap now',
               '',
               'Write (gated, requires confirm reply):',
               '/pause <campaign>',
               '/budget <campaign> <amount>',
               '/boost <campaign> <percent>',
               '',
-              'Or ask anything in plain English.',
+              'Or ask anything in plain English. The agent has web search, can drill into ads, save observations, set goals, and create rules.',
             ].join('\n'),
           );
           return;
@@ -1126,6 +1402,37 @@ bot.on('message', async (msg) => {
         case 'ad':
           await handleCreativeCmd(chatId, args);
           return;
+        case 'pixel':
+        case 'pixels': {
+          await bot.sendChatAction(chatId, 'typing');
+          const health = await getPixelHealth();
+          if (health.length === 0) {
+            await bot.sendMessage(chatId, 'No Pixels attached to this account.');
+            return;
+          }
+          const lines: string[] = ['Pixel health:', ''];
+          for (const h of health) {
+            lines.push(
+              `${h.pixel_name} (${h.pixel_id})`,
+              `  ${h.diagnosis}`,
+              `  last_fired: ${h.last_fired_time ?? 'never'}`,
+              h.events_seen.length > 0
+                ? `  events seen: ${h.events_seen.slice(0, 8).map((e) => `${e.event}(${e.count})`).join(', ')}`
+                : '  events seen: none',
+              '',
+            );
+          }
+          await sendChunked(chatId, lines.join('\n'));
+          return;
+        }
+        case 'accounts': {
+          const lines = ['Ad accounts this bot can see:', ''];
+          for (const id of AD_ACCOUNTS) {
+            lines.push(`  ${id}${id === AD_ACCOUNTS[0] ? '  (default)' : ''}`);
+          }
+          await bot.sendMessage(chatId, lines.join('\n'));
+          return;
+        }
         case 'briefing':
         case 'runbriefing':
           await bot.sendMessage(chatId, 'Running morning briefing now...');
