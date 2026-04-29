@@ -15,9 +15,41 @@ Ad account: `act_3581842128715431`
 
 ---
 
+## Claya's own historical baseline (May 2025 – Oct 2025)
+
+This account ran ads for ~6 months in 2025, then went dark Nov 2025 – Apr 2026. A new team is rebuilding for relaunch as of Apr 2026. **Treat these Claya-specific numbers as the primary baseline — they outweigh the generic vertical norms below.**
+
+Account-wide window:
+
+| Period | Spend | Leads | Blended CPL |
+|---|---|---|---|
+| Full window May–Oct 2025 | $42,224 | 466 | $90.61 |
+| May 2025 (peak quality) | $10,035 | 287 | **$34.96** ← realistic CPL target on relaunch |
+| Jun 2025 | $4,000 | 116 | $34.48 |
+| Jul 2025 | $3,976 | 62 | $64.13 |
+| Aug–Oct 2025 | ~$24,000 | ~1 | broken — Pixel/tracking issue, lead events stopped firing despite continued spend |
+
+**Per-campaign baselines** — score relaunched/cloned campaigns against their own prior version:
+
+| Campaign | Spend | Leads | CPL | CTR | CPM | Verdict |
+|---|---|---|---|---|---|---|
+| Claya Images (cold prospecting) | $16,445 | 604 | **$27.23** | 3.45% | $64 | The winner — clone first on relaunch |
+| Claya Videos (cold prospecting) | $18,008 | 182 | $98.95 | 4.47% | $99 | High CTR, weak CPL — creative engages but doesn't convert |
+| Claya Retargeting | $891 | 30 | $29.71 | 1.19% | $63 | Predictably efficient at small scale |
+| Claya Images Advantage+ Shopping | $385 | 34 | $11.32 | 1.42% | $85 | Best CPL in the account, tiny sample — scale candidate |
+| Claya Videos Advantage+ Shopping | $1,283 | 72 | $17.83 | 2.38% | $117 | Solid CPL, scale candidate |
+| "New" / "New - Copy" series (Oct 2025) | $4,508 | 0 | broken | — | — | Drained $4.5K with zero leads. **Do not relaunch as-is** — this is the cohort with the Pixel/tracking issue. Fix tracking first. |
+
+**Anti-patterns to remember:**
+- `OUTCOME_SALES` campaigns with zero leads in this account had a tracking-side problem, not a creative problem. Check the Pixel + dataset connection before blaming the ad.
+- CPL > 2× the May 2025 baseline (>$70) for 3+ days = pause-worthy unless show rate compensates.
+- Headline pattern that worked: punchy + emoji-led ("🚨GLP-1s are here to stay!", "🚨I'm down how much?!", "✨My 30-Day GLP-1 Transformation"). All CTAs were `LEARN_MORE` — worth A/B testing `BOOK_NOW` or `SIGN_UP` on relaunch.
+
+---
+
 ## Healthcare vertical benchmarks (Meta, US, 2025)
 
-Use these as **rough** anchors for diagnostic conversation, not as ground truth. Always compare a campaign to its own recent baseline first; vertical norms are tiebreakers.
+Generic anchors. **Use Claya's own baseline above first**; these are tiebreakers when there's no comparable Claya history.
 
 | Metric | Healthcare norm | Red flag below/above |
 |---|---|---|
