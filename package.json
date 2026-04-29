@@ -1,0 +1,25 @@
+{
+  "name": "facebook-ad-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram-driven Meta ad agent for Claya — read-only Phase 1 + gated Phase 2 writes",
+  "scripts": {
+    "start": "tsx agents/bot.ts",
+    "bot": "tsx agents/bot.ts",
+    "sync": "tsx agents/sync.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.91.0",
+    "@supabase/supabase-js": "^2.45.4",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0",
+    "tsx": "^4.19.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "@types/node-telegram-bot-api": "^0.64.7",
+    "typescript": "^5.6.2"
+  }
+}
