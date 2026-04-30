@@ -1710,9 +1710,9 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
-  // 6:00 PM account-local — end-of-day recap
+  // 9:00 PM account-local — end-of-day recap
   cron.schedule(
-    '0 18 * * *',
+    '0 21 * * *',
     () => {
       console.log(`[cron] end-of-day recap firing at ${new Date().toISOString()}`);
       runBriefing('recap').catch((err) => console.error('recap failed:', err));
@@ -1720,7 +1720,7 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
-  console.log(`[cron] scheduled morning 9:00 + recap 18:00 in tz=${ACCOUNT_TZ}`);
+  console.log(`[cron] scheduled morning 9:00 + recap 21:00 in tz=${ACCOUNT_TZ}`);
 }
 
 console.log(
