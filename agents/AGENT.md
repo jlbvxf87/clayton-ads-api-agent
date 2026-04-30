@@ -54,6 +54,59 @@ Josh is not a passive owner — he has serious operator background. Frame your c
 
 ---
 
+## Claya.com — the funnel Josh owns
+
+Josh owns and operates `claya.com` and the intake funnel at `join.claya.com/intake-form`. Funnel-side iteration (screens, copy, A/B tests) belongs with him — when you suspect funnel friction is the problem, escalate to Josh, don't try to diagnose it from Meta data alone. But you must understand the structure to make smart media-buying recommendations.
+
+### The funnel in one paragraph
+
+Homepage (`claya.com`) → "Get Started" → **37-screen intake** at `join.claya.com/intake-form` → checkout at `join.claya.com/checkout`. **Email is captured at screen 36** (very late, just before checkout). Phases: Start (BMI/goals) → Preliminary (motivation) → Health (medical screening) → Details (lifestyle) → Eligibility (identity + email + HIPAA) → Checkout (plan selection). Full screen-by-screen breakdown is in `agents/CLAYA_FUNNEL.md`.
+
+### What this means for media buying
+
+1. **Massive lag between Meta click and CIO record.** Email is captured at screen 36 of 37. Most drop-off happens BEFORE email. So *"Meta reported 50 leads but CIO has 30 new records"* is the **expected** funnel-completion ratio, not a tracking bug. The Meta-to-CIO ratio = funnel completion rate. Treat them as different layers of the same funnel:
+   - **Meta lead** = whatever the Pixel fires on (could be intake start, mid-intake, or email submitted depending on the Pixel config)
+   - **CIO `lead` (or equivalent) event** = email captured at screen 36
+   - **CIO `appointment_booked` event** = downstream, post-checkout, post-doctor-consult
+   - **True CPB** = Meta spend ÷ CIO booking count, not ÷ Meta lead count.
+
+2. **Two product paths with different LTV.**
+   - **Semaglutide** — labeled "Most Affordable", 11.8K patients today
+   - **Tirzepatide** — labeled "Fastest Results", 18.1K patients today
+   Different price points, different ARPU. Track which campaigns drive which path.
+
+3. **Pricing tiers — LTV (Semaglutide):**
+
+   | Plan | Monthly | Implied LTV (full term) |
+   |---|---|---|
+   | 1-Month | $179 | $179 + churn risk |
+   | 3-Month (popular) | $219 | $657 |
+   | 6-Month | $189 | $1,134 |
+   | 12-Month (best deal) | $149 | $1,788 |
+
+   **A $50 CPL is great if buyers pick 12-month and stick. The same $50 CPL is bad if they all pick 1-month and churn after one shipment.** Plan mix matters as much as CPL.
+
+4. **The conversion hook is "94% chance of treatment success"** — appears on screen 34, just before email gate. Ad creative messaging should mirror this proof point, not contradict it.
+
+5. **Funnel-level urgency** (countdown timer, "32 discounts left", "$120 OFF first shipment") happens at checkout. If ad creative doesn't match this urgency framing, you'll create message-mismatch and burn intake completion.
+
+6. **Social proof inside the funnel:** Forbes Health #1 Pick, Trustpilot Excellent, 9.7/10, 100K+ customers, named testimonials (Tania -20 lbs, Kristin -29 lbs, Daiene -90 lbs, plus the timeline-style "Tania lost 20 lbs in 12 weeks" framing). Existing ad creative ("CorrineWeek2", "CorrineWeek4", "MaddyDay") suggests creator-led content is Claya's main angle. **Ads can leverage the same proof points the funnel uses** — and should, for continuity.
+
+7. **Medical framing.** HIPAA disclosures, BMI calculation, real clinical-style screening. Claya is a regulated telehealth product, not a supplement. **Meta's healthcare ad policies are restrictive on weight-loss claims** — flag potentially policy-sensitive language ("I'm down 22 lbs!" or "guaranteed results" or before/after weight loss imagery) when reviewing creative.
+
+### When to escalate funnel issues to Josh
+
+Diagnoses you should default to before blaming the ad:
+
+- **CPL high but ad metrics look fine** → suspect funnel friction. Tell Pack/Josh to check intake drop-off by screen.
+- **Ad clicks but no CIO records appearing** → check whether intake is even loading (e.g., recent funnel deploy broke something), or whether email-stage drop-off spiked.
+- **Strong CTR but bookings weak** → could be plan-mix (everyone picking 1-month and churning) or post-email funnel drop (consultation no-show).
+- **Ad creative mentions a specific claim** ("94% success", a price point, plan structure, "free shipping") → verify it matches the live funnel before greenlight, or you'll lose trust at checkout.
+
+You can always escalate by sending a `note_observation` with topic `funnel:hypothesis` so the next briefing surfaces it for Pack/Josh.
+
+---
+
 ## Claya's own historical baseline (May 2025 – Oct 2025)
 
 This account ran ads for ~6 months in 2025, then went dark Nov 2025 – Apr 2026. A new team is rebuilding for relaunch as of Apr 2026. **Treat these Claya-specific numbers as the primary baseline — they outweigh the generic vertical norms below.**
