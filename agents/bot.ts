@@ -115,25 +115,33 @@ type PendingAction =
     };
 
 const PENDING_TTL_MS = 5 * 60 * 1000;
-const pending = new Map<number, { action: PendingAction; expiresAt: number }>();
+// Key: `${chatId}:${userId}` — scopes confirmations to the user who started the
+// action, so in group chats one person can't confirm another person's pending write.
+const pending = new Map<string, { action: PendingAction; expiresAt: number }>();
 
-function setPending(chatId: number, action: PendingAction): void {
-  pending.set(chatId, { action, expiresAt: Date.now() + PENDING_TTL_MS });
+function pendingKey(chatId: number, userId: number | string): string {
+  return `${chatId}:${userId}`;
 }
 
-function takePending(chatId: number): PendingAction | null {
-  const entry = pending.get(chatId);
+function setPending(chatId: number, userId: number | string, action: PendingAction): void {
+  pending.set(pendingKey(chatId, userId), { action, expiresAt: Date.now() + PENDING_TTL_MS });
+}
+
+function takePending(chatId: number, userId: number | string): PendingAction | null {
+  const k = pendingKey(chatId, userId);
+  const entry = pending.get(k);
   if (!entry) return null;
-  pending.delete(chatId);
+  pending.delete(k);
   if (Date.now() > entry.expiresAt) return null;
   return entry.action;
 }
 
-function peekPending(chatId: number): PendingAction | null {
-  const entry = pending.get(chatId);
+function peekPending(chatId: number, userId: number | string): PendingAction | null {
+  const k = pendingKey(chatId, userId);
+  const entry = pending.get(k);
   if (!entry) return null;
   if (Date.now() > entry.expiresAt) {
-    pending.delete(chatId);
+    pending.delete(k);
     return null;
   }
   return entry.action;
@@ -486,7 +494,7 @@ async function handleCreativeCmd(chatId: number, args: string): Promise<void> {
 
 // ---------- Slash commands: writes (build pending) ----------
 
-async function handlePauseCmd(chatId: number, args: string): Promise<void> {
+async function handlePauseCmd(chatId: number, userId: number | string, args: string): Promise<void> {
   if (!args.trim()) {
     await bot.sendMessage(chatId, 'Usage: /pause <campaign name or id>');
     return;
@@ -496,7 +504,7 @@ async function handlePauseCmd(chatId: number, args: string): Promise<void> {
     await bot.sendMessage(chatId, `No campaign matched "${args}".`);
     return;
   }
-  setPending(chatId, {
+  setPending(chatId, userId, {
     kind: 'pause',
     campaignId: campaign.id,
     campaignName: campaign.name,
@@ -507,7 +515,7 @@ async function handlePauseCmd(chatId: number, args: string): Promise<void> {
   );
 }
 
-async function handleBudgetCmd(chatId: number, args: string): Promise<void> {
+async function handleBudgetCmd(chatId: number, userId: number | string, args: string): Promise<void> {
   const m = args.trim().match(/^(.+?)\s+\$?([\d.]+)$/);
   if (!m) {
     await bot.sendMessage(chatId, 'Usage: /budget <campaign> <new daily budget in dollars>');
@@ -548,7 +556,7 @@ async function handleBudgetCmd(chatId: number, args: string): Promise<void> {
 
   const deltaWeeklyCents = oldCents != null ? (newCents - oldCents) * 7 : newCents * 7;
 
-  setPending(chatId, {
+  setPending(chatId, userId, {
     kind: 'budget',
     campaignId: campaign.id,
     campaignName: campaign.name,
@@ -561,7 +569,7 @@ async function handleBudgetCmd(chatId: number, args: string): Promise<void> {
   );
 }
 
-async function handleBoostCmd(chatId: number, args: string): Promise<void> {
+async function handleBoostCmd(chatId: number, userId: number | string, args: string): Promise<void> {
   const m = args.trim().match(/^(.+?)\s+(-?[\d.]+)\s*%?$/);
   if (!m) {
     await bot.sendMessage(chatId, 'Usage: /boost <campaign> <percent, e.g. 25 or -10>');
@@ -599,7 +607,7 @@ async function handleBoostCmd(chatId: number, args: string): Promise<void> {
     return;
   }
 
-  setPending(chatId, {
+  setPending(chatId, userId, {
     kind: 'boost',
     campaignId: campaign.id,
     campaignName: campaign.name,
@@ -1464,18 +1472,22 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // Per-user pending action: in groups, only the same user who started the
+  // /pause /budget /boost can confirm it.
+  const userKey = senderId ?? senderUsername ?? '';
+
   try {
     // If a pending action is waiting and the user did NOT start a new slash command,
     // try to interpret their reply as confirm/cancel.
-    if (peekPending(chatId) && !text.startsWith('/')) {
+    if (peekPending(chatId, userKey) && !text.startsWith('/')) {
       const verdict = classifyReply(text);
       if (verdict === 'confirm') {
-        const action = takePending(chatId);
+        const action = takePending(chatId, userKey);
         if (action) await executePending(chatId, action, handle, text);
         return;
       }
       if (verdict === 'cancel') {
-        takePending(chatId);
+        takePending(chatId, userKey);
         await bot.sendMessage(chatId, 'Cancelled.');
         return;
       }
@@ -1618,13 +1630,13 @@ bot.on('message', async (msg) => {
             .catch((err) => bot.sendMessage(chatId, `Recap failed: ${err instanceof Error ? err.message : String(err)}`));
           return;
         case 'pause':
-          await handlePauseCmd(chatId, args);
+          await handlePauseCmd(chatId, userKey, args);
           return;
         case 'budget':
-          await handleBudgetCmd(chatId, args);
+          await handleBudgetCmd(chatId, userKey, args);
           return;
         case 'boost':
-          await handleBoostCmd(chatId, args);
+          await handleBoostCmd(chatId, userKey, args);
           return;
         default:
           await bot.sendMessage(chatId, `Unknown command /${cmdRaw}. /help to list.`);
