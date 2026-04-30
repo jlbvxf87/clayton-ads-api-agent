@@ -216,6 +216,16 @@ export async function resumeCampaign(campaignId: string): Promise<unknown> {
   return data;
 }
 
+export async function setAdSetStatus(adSetId: string, status: 'ACTIVE' | 'PAUSED'): Promise<unknown> {
+  const { data } = await meta.post(`/${adSetId}`, null, { params: { status } });
+  return data;
+}
+
+export async function setAdStatus(adId: string, status: 'ACTIVE' | 'PAUSED'): Promise<unknown> {
+  const { data } = await meta.post(`/${adId}`, null, { params: { status } });
+  return data;
+}
+
 // daily budget in cents (smallest currency unit for USD accounts)
 export async function setDailyBudget(campaignId: string, dailyBudgetCents: number): Promise<unknown> {
   if (!Number.isInteger(dailyBudgetCents) || dailyBudgetCents <= 0) {

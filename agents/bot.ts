@@ -13,12 +13,15 @@ import {
   getCampaignInsights,
   extractLeads,
   pauseCampaign,
+  resumeCampaign,
   setDailyBudget,
   listAdSets,
   listAds,
   getAd,
   getAdSetInsights,
   getAdInsights,
+  setAdSetStatus,
+  setAdStatus,
   listPixels,
   getPixelHealth,
   cloneAdWithNewCopy,
@@ -876,6 +879,48 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     input_schema: { type: 'object', properties: {}, required: [] },
   },
   {
+    name: 'pause_campaign',
+    description: "Pause a campaign by ID. Sets status=PAUSED on Meta. Audit-logged. Use after the user has explicitly authorized the pause — confirm in conversation first if there's any doubt. The slash command /pause is the deterministic alternative; this tool is for when the agent itself needs to act based on a request.",
+    input_schema: {
+      type: 'object',
+      properties: { campaign_id: { type: 'string' } },
+      required: ['campaign_id'],
+    },
+  },
+  {
+    name: 'resume_campaign',
+    description: "Activate (un-pause) a campaign by ID. Sets status=ACTIVE on Meta. Audit-logged. **This is a high-blast-radius write — only call after explicit user confirmation in conversation.** Especially careful in this account given the prior \\$24K/1-lead Pixel issue: re-activation should follow Pixel verification.",
+    input_schema: {
+      type: 'object',
+      properties: { campaign_id: { type: 'string' } },
+      required: ['campaign_id'],
+    },
+  },
+  {
+    name: 'set_ad_set_status',
+    description: "Set an ad set's status to ACTIVE or PAUSED by ID. Audit-logged. Confirm in conversation before activating. Useful when activating one ad set under an active campaign.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        ad_set_id: { type: 'string' },
+        status: { type: 'string', enum: ['ACTIVE', 'PAUSED'] },
+      },
+      required: ['ad_set_id', 'status'],
+    },
+  },
+  {
+    name: 'set_ad_status',
+    description: "Set an ad's status to ACTIVE or PAUSED by ID. Audit-logged. Confirm in conversation before activating. Use when surgically activating winning ads — pull candidates first, present them, get a yes, then iterate one-by-one through this tool.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        ad_id: { type: 'string' },
+        status: { type: 'string', enum: ['ACTIVE', 'PAUSED'] },
+      },
+      required: ['ad_id', 'status'],
+    },
+  },
+  {
     name: 'clone_ad_with_new_copy',
     description: "Clone an existing ad with new headline / body / CTA / link URL, save the new ad as PAUSED. The original is untouched. Use for A/B testing copy variants. Always returns the new ad ID so the user can publish from Ads Manager when ready. NEVER touches active ads — the new ad is always paused.",
     input_schema: {
@@ -1188,6 +1233,36 @@ async function dispatchTool(
     }
     case 'list_accounts': {
       return AD_ACCOUNTS.map((id) => ({ id, is_default: id === AD_ACCOUNTS[0] }));
+    }
+    case 'pause_campaign': {
+      const cid = input.campaign_id as string;
+      const before = await getCampaign(cid).catch(() => null);
+      const resp = await pauseCampaign(cid);
+      const after = await getCampaign(cid).catch(() => null);
+      await logAgentAction(chatId, 'pause_campaign', cid, before?.name ?? null, before, after);
+      return { paused: true, response: resp };
+    }
+    case 'resume_campaign': {
+      const cid = input.campaign_id as string;
+      const before = await getCampaign(cid).catch(() => null);
+      const resp = await resumeCampaign(cid);
+      const after = await getCampaign(cid).catch(() => null);
+      await logAgentAction(chatId, 'resume_campaign', cid, before?.name ?? null, before, after);
+      return { activated: true, response: resp };
+    }
+    case 'set_ad_set_status': {
+      const id = input.ad_set_id as string;
+      const status = input.status as 'ACTIVE' | 'PAUSED';
+      const resp = await setAdSetStatus(id, status);
+      await logAgentAction(chatId, `set_ad_set_status:${status}`, id, null, null, resp);
+      return { updated: true, response: resp };
+    }
+    case 'set_ad_status': {
+      const id = input.ad_id as string;
+      const status = input.status as 'ACTIVE' | 'PAUSED';
+      const resp = await setAdStatus(id, status);
+      await logAgentAction(chatId, `set_ad_status:${status}`, id, null, null, resp);
+      return { updated: true, response: resp };
     }
     case 'clone_ad_with_new_copy': {
       const result = await cloneAdWithNewCopy({
