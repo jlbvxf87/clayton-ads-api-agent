@@ -14,6 +14,7 @@ import {
 } from './meta.js';
 import { evaluateAllRules, executeAutoTriggers, type RuleTrigger } from './rules.js';
 import { loadActiveObservations, loadActiveGoals } from './memory.js';
+import { cioCountEvents, CIO_CONFIGURED } from './customerio.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -136,6 +137,67 @@ function summarizeRows(rows: CampaignRow[]): unknown[] {
   });
 }
 
+async function gatherCioCounts(): Promise<{ enabled: boolean; today: Record<string, number>; yesterday: Record<string, number>; week: Record<string, number>; error?: string }> {
+  if (!CIO_CONFIGURED) return { enabled: false, today: {}, yesterday: {}, week: {} };
+
+  const observations = await loadActiveObservations('cio:event_names');
+  const note = observations[0]?.observation;
+  // Default event names if observation hasn't been saved yet
+  const defaults = { lead: 'lead', booking: 'appointment_booked' };
+  const eventNames = note
+    ? (() => {
+        try {
+          return JSON.parse(note) as { lead?: string; booking?: string };
+        } catch {
+          return defaults;
+        }
+      })()
+    : defaults;
+  const leadEv = eventNames.lead ?? defaults.lead;
+  const bookEv = eventNames.booking ?? defaults.booking;
+
+  const now = Math.floor(Date.now() / 1000);
+  const startOfToday = (() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return Math.floor(d.getTime() / 1000);
+  })();
+  const startOfYesterday = startOfToday - 86400;
+  const startOfWeek = startOfToday - 6 * 86400;
+
+  try {
+    const [
+      todayLead,
+      todayBook,
+      yLead,
+      yBook,
+      wLead,
+      wBook,
+    ] = await Promise.all([
+      cioCountEvents(leadEv, startOfToday, now),
+      cioCountEvents(bookEv, startOfToday, now),
+      cioCountEvents(leadEv, startOfYesterday, startOfToday),
+      cioCountEvents(bookEv, startOfYesterday, startOfToday),
+      cioCountEvents(leadEv, startOfWeek, now),
+      cioCountEvents(bookEv, startOfWeek, now),
+    ]);
+    return {
+      enabled: true,
+      today: { [leadEv]: todayLead, [bookEv]: todayBook },
+      yesterday: { [leadEv]: yLead, [bookEv]: yBook },
+      week: { [leadEv]: wLead, [bookEv]: wBook },
+    };
+  } catch (err) {
+    return {
+      enabled: true,
+      today: {},
+      yesterday: {},
+      week: {},
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 async function generateBriefingText(
   mode: 'morning' | 'recap',
   snapshot: Awaited<ReturnType<typeof gatherSnapshot>>,
@@ -144,6 +206,7 @@ async function generateBriefingText(
   const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
   const observations = await loadActiveObservations();
   const goals = await loadActiveGoals();
+  const cio = await gatherCioCounts();
 
   const prompt =
     mode === 'morning'
@@ -196,6 +259,12 @@ Tight, plain text, max 15 lines.`;
       : 'No observations yet.',
     '',
     triggerSummary,
+    '',
+    cio.enabled
+      ? cio.error
+        ? `Customer.io: error pulling counts — ${cio.error}`
+        : `Customer.io counts (default lead/booking event names; agent should refine via observation 'cio:event_names'):\n  today: ${JSON.stringify(cio.today)}\n  yesterday: ${JSON.stringify(cio.yesterday)}\n  last 7d: ${JSON.stringify(cio.week)}`
+      : 'Customer.io: not configured.',
     '',
     `Per-campaign data:\n${JSON.stringify(summarizeRows(snapshot.rows), null, 2)}`,
   ].join('\n');

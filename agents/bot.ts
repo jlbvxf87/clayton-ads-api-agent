@@ -48,6 +48,16 @@ import {
   createRule,
   setRuleActive,
 } from './rules.js';
+import {
+  cioListSegments,
+  cioCountSegment,
+  cioFindCustomerByEmail,
+  cioGetCustomerActivity,
+  cioCountEvents,
+  cioShowRate,
+  cioSendEvent,
+  CIO_CONFIGURED,
+} from './customerio.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -966,6 +976,81 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
       required: ['name', 'source_audience_id', 'ratio', 'country'],
     },
   },
+  {
+    name: 'cio_list_segments',
+    description: "List all Customer.io segments (name, id, description, customer count). Use to find segment IDs for follow-up queries or to map a Meta audience to a CIO segment.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'cio_count_segment',
+    description: "Get the live customer count of one Customer.io segment by ID. Use after cio_list_segments.",
+    input_schema: {
+      type: 'object',
+      properties: { segment_id: { type: 'integer' } },
+      required: ['segment_id'],
+    },
+  },
+  {
+    name: 'cio_find_customer_by_email',
+    description: "Find a Customer.io customer record by email. Returns id, attributes (utm_source, lead_source, etc.) — use to verify a Meta lead is in CIO and how it's tagged.",
+    input_schema: {
+      type: 'object',
+      properties: { email: { type: 'string' } },
+      required: ['email'],
+    },
+  },
+  {
+    name: 'cio_get_customer_activity',
+    description: "Pull the full event timeline for one customer (by email or CIO id). Returns events like form submits, page views, appointment_booked, etc. Use when investigating a specific lead's journey from Meta click to booking.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id_or_email: { type: 'string' },
+        limit: { type: 'integer', description: 'Default 100 most recent activities.' },
+      },
+      required: ['customer_id_or_email'],
+    },
+  },
+  {
+    name: 'cio_count_events',
+    description: "Count events of a given name in Customer.io between two timestamps. Use to count leads / bookings / purchases over a time window. Event names are workspace-specific — common ones: 'lead', 'lead_captured', 'appointment_booked', 'consultation_booked', 'purchase', 'quiz_completed'. If unsure, call cio_get_customer_activity on a known customer first to discover event names.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        event_name: { type: 'string' },
+        start_iso: { type: 'string', description: "ISO 8601 datetime, e.g. '2026-04-29T00:00:00Z'" },
+        end_iso: { type: 'string', description: "ISO 8601 datetime" },
+      },
+      required: ['event_name', 'start_iso', 'end_iso'],
+    },
+  },
+  {
+    name: 'cio_show_rate',
+    description: "Compute the booking show rate over a time window: count of `booking_event_name` divided by count of `lead_event_name`. Returns lead count, booking count, show rate %. This is the closest thing to true CPB (cost per booking) when combined with Meta spend.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        lead_event_name: { type: 'string' },
+        booking_event_name: { type: 'string' },
+        start_iso: { type: 'string' },
+        end_iso: { type: 'string' },
+      },
+      required: ['lead_event_name', 'booking_event_name', 'start_iso', 'end_iso'],
+    },
+  },
+  {
+    name: 'cio_send_event',
+    description: "Send an event INTO Customer.io for a specific customer. Use sparingly — the agent uses this to flag agent-detected milestones like 'agent_paused_campaign' or 'agent_flagged_pixel_issue' for downstream automation. Requires customer_id (CIO id) and event name.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string', description: 'CIO customer id' },
+        event_name: { type: 'string' },
+        properties: { type: 'object', description: 'Optional event properties' },
+      },
+      required: ['customer_id', 'event_name'],
+    },
+  },
 ];
 
 async function dispatchTool(
@@ -1176,6 +1261,55 @@ async function dispatchTool(
       await logAgentAction(chatId, 'create_lookalike_audience', result.id, input.name as string, null, input);
       return result;
     }
+    case 'cio_list_segments': {
+      const segs = await cioListSegments();
+      return segs.map((s) => ({ id: s.id, name: s.name, description: s.description ?? null, type: s.type ?? null }));
+    }
+    case 'cio_count_segment': {
+      return { count: await cioCountSegment(input.segment_id as number) };
+    }
+    case 'cio_find_customer_by_email': {
+      const c = await cioFindCustomerByEmail(input.email as string);
+      return c ?? { found: false };
+    }
+    case 'cio_get_customer_activity': {
+      const acts = await cioGetCustomerActivity(
+        input.customer_id_or_email as string,
+        (input.limit as number | undefined) ?? 100,
+      );
+      return acts.map((a) => ({
+        id: a.id,
+        type: a.type,
+        name: a.name ?? null,
+        timestamp: a.timestamp ?? null,
+        timestamp_iso: a.timestamp ? new Date(a.timestamp * 1000).toISOString() : null,
+        delivery_type: a.delivery_type ?? null,
+        data: a.data ?? null,
+      }));
+    }
+    case 'cio_count_events': {
+      const start = Math.floor(new Date(input.start_iso as string).getTime() / 1000);
+      const end = Math.floor(new Date(input.end_iso as string).getTime() / 1000);
+      return { count: await cioCountEvents(input.event_name as string, start, end) };
+    }
+    case 'cio_show_rate': {
+      const start = Math.floor(new Date(input.start_iso as string).getTime() / 1000);
+      const end = Math.floor(new Date(input.end_iso as string).getTime() / 1000);
+      return await cioShowRate({
+        lead_event_name: input.lead_event_name as string,
+        booking_event_name: input.booking_event_name as string,
+        start_unix: start,
+        end_unix: end,
+      });
+    }
+    case 'cio_send_event': {
+      await cioSendEvent({
+        customer_id: input.customer_id as string,
+        name: input.event_name as string,
+        data: input.properties as Record<string, unknown> | undefined,
+      });
+      return { sent: true };
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
   }
@@ -1368,6 +1502,7 @@ bot.on('message', async (msg) => {
               '/creative <ad> — pull headline, body, thumbnail, CTA into Telegram',
               '/pixel — Pixel health audit (last fire, events, diagnosis)',
               '/accounts — list ad accounts this bot has access to',
+              '/journey <email> — full Customer.io journey for one lead',
               '',
               'Daily rhythm:',
               '/briefing — fire morning briefing now',
@@ -1402,6 +1537,41 @@ bot.on('message', async (msg) => {
         case 'ad':
           await handleCreativeCmd(chatId, args);
           return;
+        case 'journey': {
+          if (!CIO_CONFIGURED) {
+            await bot.sendMessage(chatId, 'Customer.io not configured (CIO_APP_API_KEY missing).');
+            return;
+          }
+          if (!args.trim()) {
+            await bot.sendMessage(chatId, 'Usage: /journey <email>');
+            return;
+          }
+          await bot.sendChatAction(chatId, 'typing');
+          try {
+            const customer = await cioFindCustomerByEmail(args.trim());
+            if (!customer) {
+              await bot.sendMessage(chatId, `No Customer.io record found for ${args.trim()}.`);
+              return;
+            }
+            const acts = await cioGetCustomerActivity(args.trim(), 50);
+            const lines: string[] = [
+              `Customer: ${customer.email ?? args.trim()}`,
+              `CIO id: ${customer.cio_id ?? customer.id}`,
+              '',
+              `Events (${acts.length}):`,
+              '',
+            ];
+            for (const a of acts.slice(0, 50)) {
+              const t = a.timestamp ? new Date(a.timestamp * 1000).toISOString().replace('T', ' ').slice(0, 16) : '?';
+              lines.push(`${t}  ${a.type}${a.name ? ' / ' + a.name : ''}`);
+            }
+            await sendChunked(chatId, lines.join('\n'));
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err);
+            await bot.sendMessage(chatId, `Couldn't pull journey: ${m}`);
+          }
+          return;
+        }
         case 'pixel':
         case 'pixels': {
           await bot.sendChatAction(chatId, 'typing');
