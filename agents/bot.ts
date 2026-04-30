@@ -1349,7 +1349,30 @@ async function logAgentAction(
 
 // ---------- Free-form ask Claude (memory + tool-using agent loop) ----------
 
-async function askClaude(userText: string, chatId: number): Promise<void> {
+// Maps Telegram user IDs / usernames to first-name display labels Clayton uses.
+const USER_DISPLAY: Record<string, { first_name: string; full_name: string; role: string }> = {
+  '8219840935': { first_name: 'Pack', full_name: 'Jaron Baston', role: 'account owner' },
+  '519600114': { first_name: 'Josh', full_name: 'Joshua Tatum', role: 'co-operator' },
+};
+
+function identifySender(userId?: number | string, username?: string | null): { id: string; first_name: string; full_name: string; role: string } {
+  if (userId != null) {
+    const found = USER_DISPLAY[String(userId)];
+    if (found) return { id: String(userId), ...found };
+  }
+  // Fallback: username-based for cases where ID isn't passed
+  if (username) {
+    if (username.toLowerCase() === 'pack87') return { id: 'unknown', ...USER_DISPLAY['8219840935'] };
+    if (username.toLowerCase() === 'joshuatatum') return { id: 'unknown', ...USER_DISPLAY['519600114'] };
+  }
+  return { id: 'unknown', first_name: 'unknown', full_name: 'unknown', role: 'unknown' };
+}
+
+async function askClaude(
+  userText: string,
+  chatId: number,
+  sender?: { userId?: number | string; username?: string | null; chatType?: string },
+): Promise<void> {
   await bot.sendChatAction(chatId, 'typing');
 
   // 1. Persist this user turn immediately so it's part of memory even if the call fails.
@@ -1365,7 +1388,16 @@ async function askClaude(userText: string, chatId: number): Promise<void> {
   // Drop the just-recorded message off the end of history; we'll add it as the live user turn.
   const priorHistory = history.slice(0, -1);
 
+  const who = identifySender(sender?.userId, sender?.username);
+  const chatLabel =
+    sender?.chatType === 'group' || sender?.chatType === 'supergroup'
+      ? 'group chat (Meta Ads — both Pack and Josh present)'
+      : 'direct message';
+
   const sessionContext = [
+    `You are Clayton.`,
+    `Current message is from: ${who.first_name} (${who.full_name}, ${who.role}, telegram_id=${who.id})`,
+    `Conversation surface: ${chatLabel}`,
     `Current server time (UTC): ${new Date().toISOString()}`,
     `Account-local timezone: ${ACCOUNT_TZ}`,
     `Ad account: ${process.env.META_AD_ACCOUNT}`,
@@ -1380,7 +1412,7 @@ async function askClaude(userText: string, chatId: number): Promise<void> {
       ? `Active goals the user has set:\n${goals.map((g) => `- ${g.goal_key}: ${g.goal_value}`).join('\n')}`
       : 'No goals set yet.',
     '',
-    'You have tools to query the live ad account directly. Call them when you need fresh data — do not assume. Use note_observation to remember anything important for future conversations. Use set_goal when the user states a target.',
+    `Address ${who.first_name} by their first name when natural. You have tools to query the live ad account directly — call them when you need fresh data, do not assume. Use note_observation to remember anything important for future conversations. Use set_goal when the user states a target.`,
   ].join('\n');
 
   // 3. Build the message array: rolling history + a session-context turn + the current user turn.
@@ -1644,7 +1676,11 @@ bot.on('message', async (msg) => {
       }
     }
 
-    await askClaude(text, chatId);
+    await askClaude(text, chatId, {
+      userId: senderId ?? undefined,
+      username: senderUsername,
+      chatType: msg.chat.type,
+    });
   } catch (err) {
     const m = err instanceof Error ? err.message : String(err);
     console.error('handler error:', err);
