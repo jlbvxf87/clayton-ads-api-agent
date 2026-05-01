@@ -22,9 +22,11 @@ create table if not exists agent_permissions (
     last_used_at timestamptz
 );
 
+-- NOTE: only revoked_at can sit in the partial-index predicate; now() isn't
+-- IMMUTABLE so Postgres rejects it. Expiry filtering happens at query time.
 create index if not exists idx_agent_permissions_active
     on agent_permissions (kind, created_at desc)
-    where revoked_at is null and (expires_at is null or expires_at > now());
+    where revoked_at is null;
 
 create index if not exists idx_agent_permissions_grantor
     on agent_permissions (granted_by_user_id, created_at desc)

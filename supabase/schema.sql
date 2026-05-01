@@ -156,4 +156,4 @@ create table if not exists agent_permissions (
 
 create index if not exists idx_agent_permissions_active
     on agent_permissions (kind, created_at desc)
-    where revoked_at is null and (expires_at is null or expires_at > now());
+    where revoked_at is null;
