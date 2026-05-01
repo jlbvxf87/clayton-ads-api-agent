@@ -47,7 +47,9 @@ import {
   noteObservation,
   loadActiveGoals,
   setGoal,
+  getMemoryFailureCounts,
 } from './memory.js';
+import { checkSchemaHealth, formatSchemaBanner } from './healthcheck.js';
 import {
   loadActiveRules,
   createRule,
@@ -1719,21 +1721,15 @@ async function askClaude(
 ): Promise<void> {
   await bot.sendChatAction(chatId, 'typing');
 
-  // 1. Persist this user turn immediately so it's part of memory even if the call fails.
-  // Include a marker for any attached images so future replays in memory show what was sent.
-  const memoryText = images && images.length > 0
-    ? `${userText || ''}\n[${images.length} image attachment${images.length === 1 ? '' : 's'}]`.trim()
-    : userText;
-  await recordMessage(chatId, 'user', memoryText);
-
-  // 2. Pull context: rolling conversation, persistent observations, active goals.
+  // The router records the user's message before dispatch, so memory is up-to-date.
+  // 1. Pull context: rolling conversation, persistent observations, active goals.
   const [history, observations, goals] = await Promise.all([
     loadRecentMessages(chatId),
     loadActiveObservations(),
     loadActiveGoals(),
   ]);
 
-  // Drop the just-recorded message off the end of history; we'll add it as the live user turn.
+  // Drop the just-recorded user turn off the end of history; we'll add it as the live user turn.
   const priorHistory = history.slice(0, -1);
 
   const who = identifySender(sender?.userId, sender?.username);
@@ -1879,6 +1875,19 @@ bot.on('message', async (msg) => {
   // /pause /budget /boost can confirm it.
   const userKey = senderId ?? senderUsername ?? '';
 
+  // Persist the user turn at the router so EVERY message — slash commands,
+  // confirmations, free-form — is visible in memory. Tag attachments so a
+  // later replay knows what was sent.
+  const memoryText = hasImage
+    ? `${text || ''}\n[image attachment${(msg.photo?.length ?? 0) + (msg.document ? 1 : 0) === 1 ? '' : 's'}]`.trim()
+    : text;
+  if (memoryText) {
+    await recordMessage(chatId, 'user', memoryText, {
+      fromUserId: senderId,
+      fromUsername: senderUsername,
+    });
+  }
+
   try {
     // If a pending action is waiting and the user did NOT start a new slash command,
     // try to interpret their reply as confirm/cancel.
@@ -1917,6 +1926,7 @@ bot.on('message', async (msg) => {
               '/creative <ad> — pull headline, body, thumbnail, CTA into Telegram',
               '/pixel — Pixel health audit (last fire, events, diagnosis)',
               '/accounts — list ad accounts this bot has access to',
+              '/memory [N] — show last N messages I have stored for this chat (default 20)',
               '/journey <email> — full Customer.io journey for one lead',
               '',
               'Daily rhythm:',
@@ -2018,6 +2028,43 @@ bot.on('message', async (msg) => {
           await bot.sendMessage(chatId, lines.join('\n'));
           return;
         }
+        case 'memory': {
+          const requested = parseInt(args, 10);
+          const want = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 50) : 20;
+          const health = await checkSchemaHealth();
+          const recent = await loadRecentMessages(chatId);
+          const fails = getMemoryFailureCounts();
+          const lines: string[] = [];
+          lines.push(`Memory state for chat_id=${chatId}`);
+          lines.push(`  schema_ok: ${health.ok}`);
+          if (!health.ok) {
+            if (health.missing.length > 0) lines.push(`  missing tables: ${health.missing.join(', ')}`);
+            if (health.optionalMissing.length > 0)
+              lines.push(`  missing columns: ${health.optionalMissing.join(', ')}`);
+          }
+          lines.push(`  failures since boot: writes=${fails.writes} reads=${fails.reads}`);
+          lines.push(`  stored messages in this chat: ${recent.length} (showing up to ${want})`);
+          lines.push('');
+          if (recent.length === 0) {
+            lines.push('(no messages stored)');
+          } else {
+            for (const m of recent.slice(-want)) {
+              const ts = m.created_at ? m.created_at.replace('T', ' ').slice(0, 16) : '?';
+              const who =
+                m.role === 'assistant'
+                  ? 'clayton'
+                  : m.from_username
+                    ? `@${m.from_username}`
+                    : m.from_user_id
+                      ? `id=${m.from_user_id}`
+                      : 'user';
+              const preview = m.content.length > 280 ? m.content.slice(0, 280) + '…' : m.content;
+              lines.push(`${ts}  ${who}: ${preview}`);
+            }
+          }
+          await sendChunked(chatId, lines.join('\n'));
+          return;
+        }
         case 'briefing':
         case 'runbriefing':
           await bot.sendMessage(chatId, 'Running morning briefing now...');
@@ -2094,3 +2141,29 @@ if (ENABLE_CRON) {
 console.log(
   `Facebook ad agent running. model=${MODEL} account=${process.env.META_AD_ACCOUNT} tz=${ACCOUNT_TZ}`,
 );
+
+// Schema health check — fail loudly if Supabase tables are missing.
+// Memory was silently failing for hours because chat_messages didn't exist
+// and every recordMessage call returned an error we only console.warn'd.
+checkSchemaHealth()
+  .then(async (h) => {
+    const banner = formatSchemaBanner(h);
+    if (h.ok) {
+      console.log(banner);
+      return;
+    }
+    console.error(banner);
+    // Notify ops chats so the user sees it without watching Railway logs.
+    const recipients = (process.env.BRIEFING_CHAT_IDS ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const cid of recipients) {
+      try {
+        await bot.sendMessage(cid, `[boot health check]\n${banner}`);
+      } catch (err) {
+        console.error('failed to notify ops about schema health:', err);
+      }
+    }
+  })
+  .catch((err) => console.error('checkSchemaHealth crashed:', err));

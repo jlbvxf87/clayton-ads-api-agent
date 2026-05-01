@@ -35,12 +35,20 @@ create table if not exists chat_messages (
     id bigserial primary key,
     created_at timestamptz not null default now(),
     chat_id text not null,
+    from_user_id text,
+    from_username text,
     role text not null check (role in ('user','assistant')),
     content text not null
 );
 
+alter table chat_messages add column if not exists from_user_id text;
+alter table chat_messages add column if not exists from_username text;
+
 create index if not exists idx_chat_messages_lookup
     on chat_messages (chat_id, created_at desc);
+
+create index if not exists idx_chat_messages_user
+    on chat_messages (from_user_id, created_at desc) where from_user_id is not null;
 
 -- Persistent observations the agent maintains about the account.
 -- Things it learns over time: "Pixel was broken Aug-Oct 2025",
@@ -96,7 +104,7 @@ create index if not exists idx_agent_rules_active
 create table if not exists agent_briefings (
     id bigserial primary key,
     created_at timestamptz not null default now(),
-    briefing_kind text not null check (briefing_kind in ('morning','recap','rule_alert')),
+    briefing_kind text not null check (briefing_kind in ('morning','recap','rule_alert','pulse')),
     chat_id text not null,
     content text not null,
     triggered_rule_ids bigint[]
