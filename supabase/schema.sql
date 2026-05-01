@@ -126,8 +126,34 @@ create table if not exists agent_actions (
     after_state jsonb,
     meta_response jsonb,
     success boolean not null default false,
-    error_message text
+    error_message text,
+    permission_id bigint
 );
 
 create index if not exists idx_agent_actions_recent
     on agent_actions (created_at desc);
+
+create index if not exists idx_agent_actions_permission
+    on agent_actions (permission_id, created_at desc)
+    where permission_id is not null;
+
+-- Standing-order permissions Clayton checks before any agent-initiated write.
+create table if not exists agent_permissions (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    kind text not null,
+    scope jsonb not null default '{}'::jsonb,
+    granted_by_user_id text,
+    granted_by_username text,
+    granted_at_chat_id text,
+    expires_at timestamptz,
+    revoked_at timestamptz,
+    revoke_reason text,
+    notes text,
+    uses_count int not null default 0,
+    last_used_at timestamptz
+);
+
+create index if not exists idx_agent_permissions_active
+    on agent_permissions (kind, created_at desc)
+    where revoked_at is null and (expires_at is null or expires_at > now());

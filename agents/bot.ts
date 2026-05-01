@@ -51,6 +51,20 @@ import {
 } from './memory.js';
 import { checkSchemaHealth, formatSchemaBanner } from './healthcheck.js';
 import {
+  type PermissionKind,
+  type PermissionScope,
+  type RequirePermissionParams,
+  ALL_PERMISSION_KINDS,
+  listActivePermissions,
+  listAllPermissions,
+  grantPermission,
+  revokePermission,
+  recordPermissionUsage,
+  requirePermission,
+  describePermission,
+  parseGrantArgs,
+} from './permissions.js';
+import {
   loadActiveRules,
   createRule,
   setRuleActive,
@@ -186,7 +200,25 @@ type PendingAction =
       newDailyBudgetCents: number;
       oldDailyBudgetCents: number | null;
       percent: number;
-    };
+    }
+  // Agent-tool call that hit a missing-standing-order. User reply 'yes' executes it.
+  | {
+      kind: 'tool_action';
+      toolName: string;
+      input: Record<string, unknown>;
+      permKind: PermissionKind;
+      targetLabel: string;
+    }
+  // Standing-order grant pending second-factor confirmation.
+  | {
+      kind: 'grant';
+      permKind: PermissionKind;
+      scope: PermissionScope;
+      expiresAtIso: string | null;
+      notes: string | null;
+    }
+  // Standing-order revoke pending second-factor confirmation.
+  | { kind: 'revoke'; permissionId: number; reason: string | null };
 
 const PENDING_TTL_MS = 5 * 60 * 1000;
 // Key: `${chatId}:${userId}` — scopes confirmations to the user who started the
@@ -715,6 +747,7 @@ async function executePending(
   action: PendingAction,
   userHandle: string,
   originalMessage: string,
+  sender?: { userId?: number | string | null; username?: string | null },
 ): Promise<void> {
   const overrideRequested = /\bOVERRIDE\b/.test(originalMessage);
   if (isTiredFingersWindow() && !overrideRequested) {
@@ -722,6 +755,51 @@ async function executePending(
       chatId,
       'Refused: 02:00–06:00 PT is the no-write window (tired-fingers protection). Add the word OVERRIDE to your reply to bypass.',
     );
+    return;
+  }
+
+  if (action.kind === 'tool_action') {
+    try {
+      const result = await dispatchTool(action.toolName, action.input, chatId);
+      const summary =
+        typeof result === 'object' && result !== null
+          ? JSON.stringify(result).slice(0, 600)
+          : String(result);
+      await bot.sendMessage(chatId, `Confirmed: ${action.targetLabel}\n${summary}`);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      await bot.sendMessage(chatId, `Failed to ${action.targetLabel}: ${m}`);
+    }
+    return;
+  }
+
+  if (action.kind === 'grant') {
+    try {
+      const p = await grantPermission({
+        kind: action.permKind,
+        scope: action.scope,
+        expires_at: action.expiresAtIso,
+        granted_by_user_id: sender?.userId != null ? String(sender.userId) : null,
+        granted_by_username: sender?.username ?? null,
+        granted_at_chat_id: String(chatId),
+        notes: action.notes,
+      });
+      await bot.sendMessage(chatId, `Granted standing order — ${describePermission(p)}`);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      await bot.sendMessage(chatId, `Failed to grant: ${m}`);
+    }
+    return;
+  }
+
+  if (action.kind === 'revoke') {
+    try {
+      await revokePermission(action.permissionId, action.reason);
+      await bot.sendMessage(chatId, `Revoked permission #${action.permissionId}.`);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      await bot.sendMessage(chatId, `Failed to revoke: ${m}`);
+    }
     return;
   }
 
@@ -1228,6 +1306,63 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
       required: ['date_preset'],
     },
   },
+  {
+    name: 'list_permissions',
+    description:
+      "List active standing-order permissions you've been granted. Each permission specifies a kind (pause/resume/budget/etc.), an optional scope (campaign filter, budget caps, ±%), and an expiry. Call this before deciding to act autonomously so you know what's pre-authorized.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'grant_permission',
+    description:
+      "PROPOSE a new standing-order permission for yourself. The user MUST reply 'yes' before it takes effect — this tool only stages a pending grant. Use it when the user explicitly says something like 'you can pause anything for the next 24 hours'. NEVER stage a grant the user didn't ask for.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        kind: {
+          type: 'string',
+          enum: [
+            'pause',
+            'resume',
+            'budget',
+            'create_campaign',
+            'create_adset',
+            'create_ad',
+            'clone_ad',
+            'targeting',
+            'audience',
+            'cio_event',
+            'rule',
+          ],
+        },
+        scope: {
+          type: 'object',
+          description:
+            'Optional scope restrictions. Keys: campaign_ids[], campaign_name_match, ad_account_ids[], max_budget_change_pct, max_daily_budget_cents, min_daily_budget_cents, max_uses_per_day.',
+        },
+        expires_in_hours: {
+          type: 'number',
+          description:
+            'How many hours until the grant auto-expires. Omit or pass null for permanent (DANGEROUS — until revoked). Default 24.',
+        },
+        notes: { type: 'string', description: 'Why this is being granted (for the audit trail).' },
+      },
+      required: ['kind'],
+    },
+  },
+  {
+    name: 'revoke_permission',
+    description:
+      "PROPOSE revoking a standing-order permission. User must reply 'yes' to confirm. Pass the permission id from list_permissions.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        permission_id: { type: 'number' },
+        reason: { type: 'string' },
+      },
+      required: ['permission_id'],
+    },
+  },
 ];
 
 async function dispatchTool(
@@ -1663,9 +1798,336 @@ async function dispatchTool(
         diagnosis,
       };
     }
+    case 'list_permissions': {
+      const perms = await listAllPermissions(false);
+      return perms.map((p) => ({
+        id: p.id,
+        kind: p.kind,
+        scope: p.scope,
+        expires_at: p.expires_at,
+        granted_by: p.granted_by_username ?? p.granted_by_user_id,
+        notes: p.notes,
+        uses_count: p.uses_count,
+        last_used_at: p.last_used_at,
+        description: describePermission(p),
+      }));
+    }
+    case 'grant_permission': {
+      // This is a propose-only tool. The bot stages a pending grant; user reply 'yes' commits it.
+      // It must be invoked from inside an askClaude turn so we can read the userKey from there.
+      // dispatchTool can't see the userKey directly, so the wrapper handles staging — here we
+      // just return a token and let dispatchToolGuarded wire up the pending.
+      return {
+        proposed: true,
+        kind: input.kind,
+        scope: (input.scope as Record<string, unknown>) ?? {},
+        expires_in_hours: input.expires_in_hours ?? 24,
+        notes: input.notes ?? null,
+        next_step:
+          "I have NOT granted this yet. The bot wrapper will stage a pending grant; the user must reply 'yes' to commit it.",
+      };
+    }
+    case 'revoke_permission': {
+      return {
+        proposed: true,
+        permission_id: input.permission_id,
+        reason: input.reason ?? null,
+        next_step:
+          "I have NOT revoked yet. The wrapper will stage a pending revoke; the user must reply 'yes'.",
+      };
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
   }
+}
+
+// ---------- Permission slash command handlers ----------
+
+async function handlePermsCmd(chatId: number): Promise<void> {
+  const active = await listAllPermissions(false);
+  const lines: string[] = [];
+  if (active.length === 0) {
+    lines.push('No active standing orders.');
+    lines.push('');
+    lines.push('Grant one with /grant <kind> [campaign="..."] [expires=24h|7d|permanent]');
+    lines.push(`Valid kinds: ${ALL_PERMISSION_KINDS.join(', ')}`);
+  } else {
+    lines.push(`Active standing orders (${active.length}):`);
+    lines.push('');
+    for (const p of active) lines.push(describePermission(p));
+  }
+  await sendChunked(chatId, lines.join('\n'));
+}
+
+async function handleGrantCmd(
+  chatId: number,
+  userKey: string,
+  args: string,
+): Promise<void> {
+  const parsed = parseGrantArgs(args);
+  if ('error' in parsed) {
+    await bot.sendMessage(chatId, parsed.error);
+    return;
+  }
+  setPending(chatId, userKey, {
+    kind: 'grant',
+    permKind: parsed.kind,
+    scope: parsed.scope,
+    expiresAtIso: parsed.expires_at,
+    notes: parsed.notes,
+  });
+  const exp = parsed.expires_at
+    ? parsed.expires_at.replace('T', ' ').slice(0, 16)
+    : 'until revoked (DANGEROUS)';
+  const scopeStr = Object.keys(parsed.scope).length === 0 ? '(no restriction)' : JSON.stringify(parsed.scope);
+  await bot.sendMessage(
+    chatId,
+    [
+      `Pending GRANT for review:`,
+      `  kind: ${parsed.kind}`,
+      `  scope: ${scopeStr}`,
+      `  expires: ${exp}`,
+      parsed.notes ? `  notes: ${parsed.notes}` : '',
+      '',
+      `Reply "yes" to grant, "no" to cancel. (Times out in 5 min.)`,
+    ]
+      .filter(Boolean)
+      .join('\n'),
+  );
+}
+
+async function handleRevokeCmd(chatId: number, userKey: string, args: string): Promise<void> {
+  const parts = args.trim().split(/\s+/);
+  const id = Number(parts[0]);
+  if (!Number.isFinite(id) || id <= 0) {
+    await bot.sendMessage(chatId, 'Usage: /revoke <permission_id> [reason...]');
+    return;
+  }
+  const reason = parts.slice(1).join(' ') || null;
+  setPending(chatId, userKey, { kind: 'revoke', permissionId: id, reason });
+  await bot.sendMessage(
+    chatId,
+    `Pending REVOKE for permission #${id}${reason ? ` — reason: ${reason}` : ''}\nReply "yes" to revoke, "no" to cancel.`,
+  );
+}
+
+// ---------- Permission-guarded tool dispatch ----------
+//
+// Every WRITE tool (and grant/revoke proposals) routes through this wrapper.
+// Authorized by a standing order → execute and record usage.
+// No matching grant → stage a one-time pending tool_action so the user can
+// confirm with "yes" or upgrade to a /grant.
+
+interface WriteToolSpec {
+  permKind(input: Record<string, unknown>): PermissionKind;
+  paramsFor(input: Record<string, unknown>): RequirePermissionParams;
+  targetLabel(input: Record<string, unknown>): string;
+}
+
+const WRITE_TOOL_SPECS: Record<string, WriteToolSpec> = {
+  pause_campaign: {
+    permKind: () => 'pause',
+    paramsFor: (i) => ({
+      campaign_id: i.campaign_id ? String(i.campaign_id) : null,
+      campaign_name: typeof i.campaign_name === 'string' ? i.campaign_name : null,
+    }),
+    targetLabel: (i) =>
+      `pause campaign ${typeof i.campaign_name === 'string' ? '"' + i.campaign_name + '"' : i.campaign_id}`,
+  },
+  resume_campaign: {
+    permKind: () => 'resume',
+    paramsFor: (i) => ({
+      campaign_id: i.campaign_id ? String(i.campaign_id) : null,
+      campaign_name: typeof i.campaign_name === 'string' ? i.campaign_name : null,
+    }),
+    targetLabel: (i) =>
+      `activate campaign ${typeof i.campaign_name === 'string' ? '"' + i.campaign_name + '"' : i.campaign_id}`,
+  },
+  set_ad_set_status: {
+    permKind: (i) => (i.status === 'ACTIVE' ? 'resume' : 'pause'),
+    paramsFor: () => ({}),
+    targetLabel: (i) => `set ad set ${i.ad_set_id} → ${i.status}`,
+  },
+  set_ad_status: {
+    permKind: (i) => (i.status === 'ACTIVE' ? 'resume' : 'pause'),
+    paramsFor: () => ({}),
+    targetLabel: (i) => `set ad ${i.ad_id} → ${i.status}`,
+  },
+  clone_ad_with_new_copy: {
+    permKind: () => 'clone_ad',
+    paramsFor: () => ({}),
+    targetLabel: (i) => `clone ad ${i.ad_id} with new copy`,
+  },
+  create_campaign: {
+    permKind: () => 'create_campaign',
+    paramsFor: (i) => ({ campaign_name: typeof i.name === 'string' ? i.name : null }),
+    targetLabel: (i) => `create campaign "${i.name}"`,
+  },
+  create_ad_set: {
+    permKind: () => 'create_adset',
+    paramsFor: (i) => ({ campaign_id: i.campaign_id ? String(i.campaign_id) : null }),
+    targetLabel: (i) => `create ad set "${i.name}" under campaign ${i.campaign_id}`,
+  },
+  create_ad: {
+    permKind: () => 'create_ad',
+    paramsFor: () => ({}),
+    targetLabel: (i) => `create ad "${i.name}" in ad set ${i.adset_id}`,
+  },
+  update_ad_set_targeting: {
+    permKind: () => 'targeting',
+    paramsFor: () => ({}),
+    targetLabel: (i) => `update targeting on ad set ${i.ad_set_id}`,
+  },
+  create_lookalike_audience: {
+    permKind: () => 'audience',
+    paramsFor: () => ({}),
+    targetLabel: (i) => `create lookalike audience "${i.name}"`,
+  },
+  cio_send_event: {
+    permKind: () => 'cio_event',
+    paramsFor: () => ({}),
+    targetLabel: (i) => `send CIO event "${i.event_name}" → ${i.customer_id}`,
+  },
+  create_rule: {
+    permKind: () => 'rule',
+    paramsFor: () => ({}),
+    targetLabel: (i) => `create rule "${i.name}"`,
+  },
+  disable_rule: {
+    permKind: () => 'rule',
+    paramsFor: () => ({}),
+    targetLabel: (i) => `disable rule ${i.rule_id}`,
+  },
+};
+
+const PROPOSE_ONLY_TOOLS = new Set(['grant_permission', 'revoke_permission']);
+
+async function dispatchToolGuarded(
+  toolName: string,
+  input: Record<string, unknown>,
+  chatId: number,
+  userKey: string | undefined,
+  sender: { userId?: number | string; username?: string | null } | undefined,
+): Promise<unknown> {
+  // Propose-only tools: stage a pending grant/revoke and ask user for confirm.
+  if (toolName === 'grant_permission') {
+    const kindRaw = String(input.kind ?? '');
+    if (!(ALL_PERMISSION_KINDS as string[]).includes(kindRaw)) {
+      return { error: `Unknown permission kind "${kindRaw}". Valid: ${ALL_PERMISSION_KINDS.join(', ')}` };
+    }
+    const kind = kindRaw as PermissionKind;
+    const scope = ((input.scope as PermissionScope | undefined) ?? {}) as PermissionScope;
+    const hours =
+      input.expires_in_hours == null ? 24 : Number(input.expires_in_hours);
+    const expiresAtIso =
+      input.expires_in_hours === null
+        ? null
+        : Number.isFinite(hours) && hours > 0
+          ? new Date(Date.now() + hours * 3600 * 1000).toISOString()
+          : null;
+    const notes = typeof input.notes === 'string' ? input.notes : null;
+    if (userKey) {
+      setPending(chatId, userKey, {
+        kind: 'grant',
+        permKind: kind,
+        scope,
+        expiresAtIso,
+        notes,
+      });
+    }
+    await bot.sendMessage(
+      chatId,
+      [
+        `Pending GRANT for review:`,
+        `  kind: ${kind}`,
+        `  scope: ${JSON.stringify(scope)}`,
+        `  expires: ${expiresAtIso ? expiresAtIso.replace('T', ' ').slice(0, 16) : 'until revoked (DANGEROUS)'}`,
+        notes ? `  notes: ${notes}` : '',
+        '',
+        'Reply "yes" to grant, "no" to cancel.',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+    return {
+      pending_confirmation: true,
+      kind,
+      next_step: "Tell the user to reply 'yes' to commit the grant or 'no' to cancel.",
+    };
+  }
+  if (toolName === 'revoke_permission') {
+    const id = Number(input.permission_id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return { error: `permission_id must be a positive number; got ${input.permission_id}` };
+    }
+    const reason = typeof input.reason === 'string' ? input.reason : null;
+    if (userKey) {
+      setPending(chatId, userKey, { kind: 'revoke', permissionId: id, reason });
+    }
+    await bot.sendMessage(
+      chatId,
+      `Pending REVOKE for permission #${id}${reason ? ` — reason: ${reason}` : ''}\nReply "yes" to revoke, "no" to cancel.`,
+    );
+    return {
+      pending_confirmation: true,
+      next_step: "Tell the user to reply 'yes' to revoke or 'no' to cancel.",
+    };
+  }
+  if (PROPOSE_ONLY_TOOLS.has(toolName)) {
+    return dispatchTool(toolName, input, chatId);
+  }
+
+  // Read tools / memory tools / read-only execution: pass through.
+  const spec = WRITE_TOOL_SPECS[toolName];
+  if (!spec) return dispatchTool(toolName, input, chatId);
+
+  const permKind = spec.permKind(input);
+  const params = spec.paramsFor(input);
+  const targetLabel = spec.targetLabel(input);
+
+  const guard = await requirePermission(permKind, params);
+  if (guard.ok) {
+    const result = await dispatchTool(toolName, input, chatId);
+    await recordPermissionUsage(guard.permission_id);
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      return { ...(result as Record<string, unknown>), used_permission_id: guard.permission_id };
+    }
+    return result;
+  }
+
+  // Denied — stage a pending tool_action so user can confirm one-shot or grant.
+  if (userKey) {
+    setPending(chatId, userKey, {
+      kind: 'tool_action',
+      toolName,
+      input,
+      permKind,
+      targetLabel,
+    });
+  }
+  await bot.sendMessage(
+    chatId,
+    [
+      `I want to ${targetLabel}, but no standing order covers it.`,
+      guard.message,
+      '',
+      'Reply "yes" to confirm this one action, or grant a standing order:',
+      ...guard.suggested_grants.map((g) => `  ${g}`),
+    ].join('\n'),
+  );
+  void sender; // reserved for future audit trail enrichment
+  return {
+    permission_required: true,
+    kind: permKind,
+    target: targetLabel,
+    why: guard.reason,
+    message: guard.message,
+    suggested_grants: guard.suggested_grants,
+    pending_staged: Boolean(userKey),
+    next_step: userKey
+      ? "I asked the user to reply 'yes' or grant a standing order. Wait for their reply — do NOT call this tool again in this turn."
+      : 'Ask the user to confirm by re-issuing as a slash command.',
+  };
 }
 
 async function logAgentAction(
@@ -1719,6 +2181,7 @@ async function askClaude(
   sender?: { userId?: number | string; username?: string | null; chatType?: string },
   images?: AttachedImage[],
 ): Promise<void> {
+  const guardUserKey = sender?.userId != null ? String(sender.userId) : (sender?.username ?? undefined);
   await bot.sendChatAction(chatId, 'typing');
 
   // The router records the user's message before dispatch, so memory is up-to-date.
@@ -1816,7 +2279,13 @@ async function askClaude(
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
     for (const tu of toolUseBlocks) {
       try {
-        const result = await dispatchTool(tu.name, tu.input as Record<string, unknown>, chatId);
+        const result = await dispatchToolGuarded(
+          tu.name,
+          tu.input as Record<string, unknown>,
+          chatId,
+          guardUserKey,
+          sender,
+        );
         toolResults.push({
           type: 'tool_result',
           tool_use_id: tu.id,
@@ -1895,7 +2364,11 @@ bot.on('message', async (msg) => {
       const verdict = classifyReply(text);
       if (verdict === 'confirm') {
         const action = takePending(chatId, userKey);
-        if (action) await executePending(chatId, action, handle, text);
+        if (action)
+          await executePending(chatId, action, handle, text, {
+            userId: senderId,
+            username: senderUsername,
+          });
         return;
       }
       if (verdict === 'cancel') {
@@ -1937,6 +2410,11 @@ bot.on('message', async (msg) => {
               '/pause <campaign>',
               '/budget <campaign> <amount>',
               '/boost <campaign> <percent>',
+              '',
+              'Permissions (standing orders for autonomous writes):',
+              '/perms — list active standing orders',
+              '/grant <kind> [campaign="..."] [expires=24h|7d|permanent]',
+              '/revoke <id> [reason...]',
               '',
               'Or ask anything in plain English. The agent has web search, can drill into ads, save observations, set goals, and create rules.',
             ].join('\n'),
@@ -2087,6 +2565,16 @@ bot.on('message', async (msg) => {
           return;
         case 'boost':
           await handleBoostCmd(chatId, userKey, args);
+          return;
+        case 'perms':
+        case 'permissions':
+          await handlePermsCmd(chatId);
+          return;
+        case 'grant':
+          await handleGrantCmd(chatId, userKey, args);
+          return;
+        case 'revoke':
+          await handleRevokeCmd(chatId, userKey, args);
           return;
         default:
           await bot.sendMessage(chatId, `Unknown command /${cmdRaw}. /help to list.`);

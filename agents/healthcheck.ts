@@ -8,6 +8,7 @@ const REQUIRED_TABLES = [
   'agent_goals',
   'agent_rules',
   'agent_briefings',
+  'agent_permissions',
 ] as const;
 
 export type TableName = (typeof REQUIRED_TABLES)[number];
@@ -20,6 +21,7 @@ export interface SchemaHealth {
 
 const REQUIRED_COLUMNS: Record<string, string[]> = {
   chat_messages: ['from_user_id', 'from_username'],
+  agent_actions: ['permission_id'],
 };
 
 async function tableExists(name: TableName): Promise<boolean> {
