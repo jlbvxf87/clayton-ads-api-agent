@@ -65,6 +65,12 @@ import {
   parseGrantArgs,
 } from './permissions.js';
 import {
+  runMonitorTick,
+  listOpenInbox,
+  listRecentInbox,
+  resolveInboxItem,
+} from './monitor.js';
+import {
   loadActiveRules,
   createRule,
   setRuleActive,
@@ -1307,6 +1313,40 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'list_inbox',
+    description:
+      "Read the real-time monitor inbox. Each open signal is a cpl_spike / zero_leads / ctr_drop / spend_velocity item. Critical and alert items already pinged the user; notice/info items sit silently here for you to review. Call this when the user asks 'what's going on right now' or before suggesting action.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        only_open: {
+          type: 'boolean',
+          description: 'If true (default), only unresolved items. If false, recent 24h including resolved.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'resolve_inbox_item',
+    description:
+      "Mark an inbox signal resolved with a short note explaining why. Use when the underlying issue is addressed (you paused the campaign, the user said it's intentional, etc.). Read-write but doesn't need permission gating — it's a local memory mark, not a Meta write.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        inbox_id: { type: 'number' },
+        note: { type: 'string' },
+      },
+      required: ['inbox_id'],
+    },
+  },
+  {
+    name: 'run_monitor_tick',
+    description:
+      "Force-run the monitor tick now instead of waiting for the 15-minute cron. Returns counts (detected, new_inbox, surfaced, auto_acted, auto_resolved). Use when the user asks 'check now' or after granting a standing order so any waiting items can auto-resolve.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
     name: 'list_permissions',
     description:
       "List active standing-order permissions you've been granted. Each permission specifies a kind (pause/resume/budget/etc.), an optional scope (campaign filter, budget caps, ±%), and an expiry. Call this before deciding to act autonomously so you know what's pre-authorized.",
@@ -1797,6 +1837,36 @@ async function dispatchTool(
         cio_to_meta_ratio: ratio,
         diagnosis,
       };
+    }
+    case 'list_inbox': {
+      const onlyOpen = (input.only_open as boolean | undefined) ?? true;
+      const items = onlyOpen ? await listOpenInbox(50) : await listRecentInbox(24, 100);
+      return items.map((it) => ({
+        id: it.id,
+        signal_kind: it.signal_kind,
+        severity: it.severity,
+        target: { type: it.target_type, id: it.target_id, name: it.target_name },
+        current: it.current_value,
+        baseline: it.baseline_value,
+        delta_pct: it.delta_pct,
+        message: it.message,
+        last_seen_at: it.last_seen_at,
+        surfaced: it.surfaced_to_telegram,
+        resolved: it.resolved_at != null,
+        resolved_by: it.resolved_by,
+        auto_action_taken: it.auto_action_taken,
+      }));
+    }
+    case 'resolve_inbox_item': {
+      const id = Number(input.inbox_id);
+      if (!Number.isFinite(id) || id <= 0) return { error: 'inbox_id must be positive' };
+      const note = (input.note as string | undefined) ?? null;
+      const ok = await resolveInboxItem(id, 'agent:clayton', note);
+      return { resolved: ok };
+    }
+    case 'run_monitor_tick': {
+      const r = await runMonitorTick();
+      return r;
     }
     case 'list_permissions': {
       const perms = await listAllPermissions(false);
@@ -2416,6 +2486,11 @@ bot.on('message', async (msg) => {
               '/grant <kind> [campaign="..."] [expires=24h|7d|permanent]',
               '/revoke <id> [reason...]',
               '',
+              'Real-time monitor:',
+              '/inbox — open signals (cpl spike, zero leads, etc.)',
+              '/inbox resolve <id> [note] — dismiss an inbox item',
+              '/monitor — run a monitor tick now (test)',
+              '',
               'Or ask anything in plain English. The agent has web search, can drill into ads, save observations, set goals, and create rules.',
             ].join('\n'),
           );
@@ -2570,6 +2645,49 @@ bot.on('message', async (msg) => {
         case 'permissions':
           await handlePermsCmd(chatId);
           return;
+        case 'inbox': {
+          const sub = args.trim().split(/\s+/);
+          if (sub[0] === 'resolve') {
+            const id = Number(sub[1]);
+            if (!Number.isFinite(id) || id <= 0) {
+              await bot.sendMessage(chatId, 'Usage: /inbox resolve <id> [note]');
+              return;
+            }
+            const note = sub.slice(2).join(' ') || null;
+            const ok = await resolveInboxItem(id, `user:${senderUsername ?? senderId ?? 'unknown'}`, note);
+            await bot.sendMessage(chatId, ok ? `Resolved inbox #${id}.` : `Couldn't resolve #${id} (already closed?).`);
+            return;
+          }
+          const open = await listOpenInbox(50);
+          if (open.length === 0) {
+            await bot.sendMessage(chatId, "Inbox empty. Nothing has tripped a signal.");
+            return;
+          }
+          const lines: string[] = [`${open.length} open signal${open.length === 1 ? '' : 's'}:`, ''];
+          for (const it of open) {
+            const ts = it.last_seen_at.replace('T', ' ').slice(0, 16);
+            lines.push(`#${it.id} [${it.severity}] ${it.message}`);
+            lines.push(`   kind=${it.signal_kind} last_seen=${ts}${it.surfaced_to_telegram ? ' (notified)' : ''}`);
+          }
+          lines.push('');
+          lines.push('/inbox resolve <id> to dismiss');
+          await sendChunked(chatId, lines.join('\n'));
+          return;
+        }
+        case 'monitor': {
+          await bot.sendMessage(chatId, 'Running monitor tick now…');
+          try {
+            const r = await runMonitorTick();
+            await bot.sendMessage(
+              chatId,
+              `Tick: detected=${r.detected} new=${r.new_inbox} surfaced=${r.surfaced} auto_acted=${r.auto_acted} auto_resolved=${r.auto_resolved_open}`,
+            );
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err);
+            await bot.sendMessage(chatId, `Monitor failed: ${m}`);
+          }
+          return;
+        }
         case 'grant':
           await handleGrantCmd(chatId, userKey, args);
           return;
@@ -2612,7 +2730,7 @@ bot.on('polling_error', (err) => {
 const ENABLE_CRON = (process.env.ENABLE_CRON ?? 'true').toLowerCase() !== 'false';
 
 if (ENABLE_CRON) {
-  // Every 3 hours account-local — pulse check.
+  // Every 3 hours account-local — pulse check (broad summary).
   // Fires at 0, 3, 6, 9, 12, 15, 18, 21 PT (8 times a day).
   cron.schedule(
     '0 */3 * * *',
@@ -2623,7 +2741,23 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
-  console.log(`[cron] scheduled pulse every 3 hours in tz=${ACCOUNT_TZ}`);
+  // Every 15 minutes — fast monitor tick (delta detection, inbox, auto-act).
+  cron.schedule(
+    '*/15 * * * *',
+    () => {
+      console.log(`[cron] monitor tick firing at ${new Date().toISOString()}`);
+      runMonitorTick()
+        .then((r) =>
+          console.log(
+            `[monitor] detected=${r.detected} new_inbox=${r.new_inbox} surfaced=${r.surfaced} auto_acted=${r.auto_acted} auto_resolved=${r.auto_resolved_open}`,
+          ),
+        )
+        .catch((err) => console.error('monitor tick failed:', err));
+    },
+    { timezone: ACCOUNT_TZ },
+  );
+
+  console.log(`[cron] scheduled pulse every 3h + monitor every 15m in tz=${ACCOUNT_TZ}`);
 }
 
 console.log(

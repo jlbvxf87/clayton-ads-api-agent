@@ -137,6 +137,38 @@ create index if not exists idx_agent_actions_permission
     on agent_actions (permission_id, created_at desc)
     where permission_id is not null;
 
+-- Real-time monitor inbox — open signals (cpl_spike, zero_leads, etc.).
+create table if not exists agent_inbox (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    last_seen_at timestamptz not null default now(),
+    signal_kind text not null,
+    severity text not null check (severity in ('info','notice','alert','critical')),
+    target_type text,
+    target_id text,
+    target_name text,
+    current_value numeric,
+    baseline_value numeric,
+    delta_pct numeric,
+    message text not null,
+    data jsonb,
+    surfaced_to_telegram boolean not null default false,
+    surfaced_at timestamptz,
+    resolved_at timestamptz,
+    resolved_by text,
+    resolution_note text,
+    auto_action_taken boolean not null default false,
+    auto_action_permission_id bigint
+);
+
+create index if not exists idx_agent_inbox_open
+    on agent_inbox (signal_kind, target_id, last_seen_at desc)
+    where resolved_at is null;
+
+create unique index if not exists idx_agent_inbox_open_unique
+    on agent_inbox (signal_kind, target_id)
+    where resolved_at is null;
+
 -- Standing-order permissions Clayton checks before any agent-initiated write.
 create table if not exists agent_permissions (
     id bigserial primary key,

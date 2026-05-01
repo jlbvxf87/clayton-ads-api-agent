@@ -9,6 +9,7 @@ const REQUIRED_TABLES = [
   'agent_rules',
   'agent_briefings',
   'agent_permissions',
+  'agent_inbox',
 ] as const;
 
 export type TableName = (typeof REQUIRED_TABLES)[number];
