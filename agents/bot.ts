@@ -97,6 +97,72 @@ const AGENT_MD = fs.readFileSync(AGENT_MD_PATH, 'utf-8');
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+// ---------- Image attachment handling ----------
+
+interface AttachedImage {
+  media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+  data: string; // base64
+}
+
+const MAX_IMAGE_BYTES = 4_500_000; // ~4.5 MB — under Anthropic's 5 MB cap
+
+function detectImageMime(bytes: Buffer): AttachedImage['media_type'] {
+  // Sniff the first few magic bytes
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return 'image/png';
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+    return 'image/gif';
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  return 'image/jpeg'; // safe default
+}
+
+async function downloadAttachedImage(fileId: string): Promise<AttachedImage | null> {
+  try {
+    const link = await bot.getFileLink(fileId);
+    const response = await fetch(link);
+    if (!response.ok) return null;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > MAX_IMAGE_BYTES) {
+      console.warn(`image ${fileId} too large (${buffer.length} bytes), skipping`);
+      return null;
+    }
+    return {
+      media_type: detectImageMime(buffer),
+      data: buffer.toString('base64'),
+    };
+  } catch (err) {
+    console.warn('downloadAttachedImage failed:', err);
+    return null;
+  }
+}
+
+async function extractImagesFromMessage(msg: TelegramBot.Message): Promise<AttachedImage[]> {
+  const out: AttachedImage[] = [];
+  // Telegram sends photos at multiple resolutions in msg.photo; the largest is last.
+  if (msg.photo && msg.photo.length > 0) {
+    const largest = msg.photo[msg.photo.length - 1];
+    const img = await downloadAttachedImage(largest.file_id);
+    if (img) out.push(img);
+  }
+  // Photos sent as documents (e.g. iOS "send original" path)
+  if (msg.document && msg.document.mime_type?.startsWith('image/')) {
+    const img = await downloadAttachedImage(msg.document.file_id);
+    if (img) out.push(img);
+  }
+  return out;
+}
+
 // ---------- Pending action state ----------
 
 type PendingAction =
@@ -1447,11 +1513,16 @@ async function askClaude(
   userText: string,
   chatId: number,
   sender?: { userId?: number | string; username?: string | null; chatType?: string },
+  images?: AttachedImage[],
 ): Promise<void> {
   await bot.sendChatAction(chatId, 'typing');
 
   // 1. Persist this user turn immediately so it's part of memory even if the call fails.
-  await recordMessage(chatId, 'user', userText);
+  // Include a marker for any attached images so future replays in memory show what was sent.
+  const memoryText = images && images.length > 0
+    ? `${userText || ''}\n[${images.length} image attachment${images.length === 1 ? '' : 's'}]`.trim()
+    : userText;
+  await recordMessage(chatId, 'user', memoryText);
 
   // 2. Pull context: rolling conversation, persistent observations, active goals.
   const [history, observations, goals] = await Promise.all([
@@ -1490,11 +1561,27 @@ async function askClaude(
     `Address ${who.first_name} by their first name when natural. You have tools to query the live ad account directly — call them when you need fresh data, do not assume. Use note_observation to remember anything important for future conversations. Use set_goal when the user states a target.`,
   ].join('\n');
 
-  // 3. Build the message array: rolling history + a session-context turn + the current user turn.
+  // 3. Build the current user turn — image blocks first, then text.
+  // If the user sent images with no caption, give Claude a hint so it knows to look.
+  const userBlocks: Anthropic.ContentBlockParam[] = [];
+  for (const img of images ?? []) {
+    userBlocks.push({
+      type: 'image',
+      source: { type: 'base64', media_type: img.media_type, data: img.data },
+    });
+  }
+  const captionText = userText.trim()
+    ? userText
+    : images && images.length > 0
+      ? '(image attached, no caption — describe what you see and react accordingly)'
+      : '';
+  if (captionText) userBlocks.push({ type: 'text', text: captionText });
+
+  // Build the message array: rolling history + session-context turn + current user turn.
   const messages: Anthropic.MessageParam[] = [
     ...priorHistory.map((m) => ({ role: m.role, content: m.content })),
     { role: 'user', content: `[session context]\n${sessionContext}` },
-    { role: 'user', content: userText },
+    { role: 'user', content: userBlocks.length > 0 ? userBlocks : userText },
   ];
 
   // 4. Tool-use loop: keep calling Claude until it stops asking for tools.
@@ -1562,10 +1649,17 @@ async function askClaude(
 
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
-  const text = (msg.text ?? '').trim();
+  // Photo messages have caption instead of text. Use whichever is present.
+  const text = (msg.text ?? msg.caption ?? '').trim();
   const handle = msg.from?.username ?? msg.from?.first_name ?? String(msg.from?.id ?? 'unknown');
 
-  if (!text) return;
+  // Detect image attachments early so we can route them through Claude even with no text.
+  const hasImage =
+    (msg.photo && msg.photo.length > 0) ||
+    Boolean(msg.document && msg.document.mime_type?.startsWith('image/'));
+
+  // Skip messages that have no text and no image (Telegram service messages, stickers, etc.)
+  if (!text && !hasImage) return;
 
   // Auth: allow if user_id is whitelisted OR username is whitelisted.
   const senderId = msg.from?.id != null ? String(msg.from.id) : null;
@@ -1751,11 +1845,17 @@ bot.on('message', async (msg) => {
       }
     }
 
-    await askClaude(text, chatId, {
-      userId: senderId ?? undefined,
-      username: senderUsername,
-      chatType: msg.chat.type,
-    });
+    const attachedImages = hasImage ? await extractImagesFromMessage(msg) : [];
+    await askClaude(
+      text,
+      chatId,
+      {
+        userId: senderId ?? undefined,
+        username: senderUsername,
+        chatType: msg.chat.type,
+      },
+      attachedImages,
+    );
   } catch (err) {
     const m = err instanceof Error ? err.message : String(err);
     console.error('handler error:', err);
@@ -1775,27 +1875,18 @@ bot.on('polling_error', (err) => {
 const ENABLE_CRON = (process.env.ENABLE_CRON ?? 'true').toLowerCase() !== 'false';
 
 if (ENABLE_CRON) {
-  // 9:00 AM account-local — morning briefing
+  // Every 3 hours account-local — pulse check.
+  // Fires at 0, 3, 6, 9, 12, 15, 18, 21 PT (8 times a day).
   cron.schedule(
-    '0 9 * * *',
+    '0 */3 * * *',
     () => {
-      console.log(`[cron] morning briefing firing at ${new Date().toISOString()}`);
-      runBriefing('morning').catch((err) => console.error('morning briefing failed:', err));
+      console.log(`[cron] pulse firing at ${new Date().toISOString()}`);
+      runBriefing('pulse').catch((err) => console.error('pulse failed:', err));
     },
     { timezone: ACCOUNT_TZ },
   );
 
-  // 9:00 PM account-local — end-of-day recap
-  cron.schedule(
-    '0 21 * * *',
-    () => {
-      console.log(`[cron] end-of-day recap firing at ${new Date().toISOString()}`);
-      runBriefing('recap').catch((err) => console.error('recap failed:', err));
-    },
-    { timezone: ACCOUNT_TZ },
-  );
-
-  console.log(`[cron] scheduled morning 9:00 + recap 21:00 in tz=${ACCOUNT_TZ}`);
+  console.log(`[cron] scheduled pulse every 3 hours in tz=${ACCOUNT_TZ}`);
 }
 
 console.log(

@@ -199,7 +199,7 @@ async function gatherCioCounts(): Promise<{ enabled: boolean; today: Record<stri
 }
 
 async function generateBriefingText(
-  mode: 'morning' | 'recap',
+  mode: 'morning' | 'recap' | 'pulse',
   snapshot: Awaited<ReturnType<typeof gatherSnapshot>>,
   triggers: RuleTrigger[],
 ): Promise<string> {
@@ -217,13 +217,20 @@ async function generateBriefingText(
 4) One specific recommended action for today, with the exact slash command they can run.
 
 Tight, numbers-first, no fluff. Plain text. Max 15 lines.`
-      : `Write the end-of-day recap for the user. They are about to wrap for the day. Cover:
+      : mode === 'recap'
+        ? `Write the end-of-day recap for the user. They are about to wrap for the day. Cover:
 1) Today's outcome vs. their goal (spend, leads, CPL, % of cap used).
 2) The single best ad/campaign of the day, by leads or CPL.
 3) The single worst, with a specific reason if you can identify it from the data.
 4) Anything to do tomorrow morning.
 
-Tight, plain text, max 15 lines.`;
+Tight, plain text, max 15 lines.`
+        : `Write a quick pulse check for the user. This is one of 8 every-3-hour status updates per day, not a full briefing. Cover, in 2-5 lines max:
+1) Spend pacing today vs. expected at this hour (use today's hours-elapsed % to project where spend should be).
+2) Anything new since the last pulse: rule triggers, status flips, new spend on a previously-dark campaign.
+3) One thing to watch in the next 3 hours, if anything material.
+
+If nothing has materially changed, say so in ONE LINE: "No movement since last pulse — \\$X spent, Y leads, all quiet." Don't pad. Plain text, no header.`;
 
   const triggerSummary =
     triggers.length === 0
@@ -287,7 +294,7 @@ Tight, plain text, max 15 lines.`;
     .trim();
 }
 
-async function deliver(text: string, mode: 'morning' | 'recap', triggerIds: number[]): Promise<void> {
+async function deliver(text: string, mode: 'morning' | 'recap' | 'pulse', triggerIds: number[]): Promise<void> {
   const recipients = await loadRecipientChatIds();
   if (recipients.length === 0) {
     console.warn('No recipient chat IDs found. Set BRIEFING_CHAT_IDS or DM the bot once first.');
@@ -297,7 +304,8 @@ async function deliver(text: string, mode: 'morning' | 'recap', triggerIds: numb
   }
 
   const bot = new TelegramBot(TELEGRAM_TOKEN!, { polling: false });
-  const header = mode === 'morning' ? 'Morning briefing' : 'End-of-day recap';
+  const header =
+    mode === 'morning' ? 'Morning briefing' : mode === 'recap' ? 'End-of-day recap' : 'Pulse check';
   const body = `${header}\n\n${text}`;
 
   for (const chatId of recipients) {
@@ -350,10 +358,10 @@ async function snapshotIntoSupabase(rows: CampaignRow[]): Promise<void> {
 }
 
 /**
- * Run a briefing or recap end-to-end: snapshot, evaluate rules,
+ * Run a briefing / recap / pulse end-to-end: snapshot, evaluate rules,
  * generate Claude text, deliver to Telegram. Importable from bot.ts.
  */
-export async function runBriefing(mode: 'morning' | 'recap'): Promise<void> {
+export async function runBriefing(mode: 'morning' | 'recap' | 'pulse'): Promise<void> {
   console.log(`Briefing run: mode=${mode} at ${new Date().toISOString()}`);
 
   const snapshot = await gatherSnapshot();
@@ -373,9 +381,9 @@ export async function runBriefing(mode: 'morning' | 'recap'): Promise<void> {
 // Only run as a CLI when this file is the entry point.
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
-  const mode = (process.argv[2] ?? 'morning') as 'morning' | 'recap';
-  if (mode !== 'morning' && mode !== 'recap') {
-    console.error(`Unknown mode: ${mode}. Use 'morning' or 'recap'.`);
+  const mode = (process.argv[2] ?? 'morning') as 'morning' | 'recap' | 'pulse';
+  if (mode !== 'morning' && mode !== 'recap' && mode !== 'pulse') {
+    console.error(`Unknown mode: ${mode}. Use 'morning', 'recap', or 'pulse'.`);
     process.exit(1);
   }
   runBriefing(mode).catch((err) => {
