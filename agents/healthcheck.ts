@@ -10,6 +10,9 @@ const REQUIRED_TABLES = [
   'agent_briefings',
   'agent_permissions',
   'agent_inbox',
+  'capi_config',
+  'capi_event_map',
+  'capi_forwards',
 ] as const;
 
 export type TableName = (typeof REQUIRED_TABLES)[number];

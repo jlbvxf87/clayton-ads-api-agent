@@ -137,6 +137,55 @@ create index if not exists idx_agent_actions_permission
     on agent_actions (permission_id, created_at desc)
     where permission_id is not null;
 
+-- CAPI bridge: forward CIO events to Meta Conversions API.
+create table if not exists capi_config (
+    id int primary key default 1,
+    pixel_id text,
+    enabled boolean not null default false,
+    default_action_source text not null default 'system_generated',
+    default_event_source_url text,
+    test_event_code text,
+    notes text,
+    updated_at timestamptz not null default now(),
+    updated_by_user_id text,
+    updated_by_username text,
+    constraint capi_config_singleton check (id = 1)
+);
+
+create table if not exists capi_event_map (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    cio_event_name text not null unique,
+    meta_event_name text not null,
+    action_source text not null default 'system_generated',
+    enabled boolean not null default true,
+    config jsonb not null default '{}'::jsonb,
+    notes text
+);
+
+create table if not exists capi_forwards (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    cio_activity_id text not null,
+    cio_event_name text not null,
+    meta_event_name text not null,
+    pixel_id text not null,
+    meta_event_id text not null,
+    customer_id text,
+    customer_email text,
+    event_time bigint,
+    success boolean not null default false,
+    http_status int,
+    meta_response jsonb,
+    error_message text
+);
+
+create unique index if not exists idx_capi_forwards_dedup
+    on capi_forwards (cio_activity_id, meta_event_id);
+
+create index if not exists idx_capi_forwards_recent
+    on capi_forwards (created_at desc);
+
 -- Real-time monitor inbox — open signals (cpl_spike, zero_leads, etc.).
 create table if not exists agent_inbox (
     id bigserial primary key,

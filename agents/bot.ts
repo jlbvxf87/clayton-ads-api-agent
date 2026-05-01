@@ -71,6 +71,16 @@ import {
   resolveInboxItem,
 } from './monitor.js';
 import {
+  getCapiConfig,
+  updateCapiConfig,
+  listEventMap,
+  upsertEventMap,
+  deleteEventMap,
+  runCapiTick,
+  runCapiBackfill,
+  listRecentForwards,
+} from './capi.js';
+import {
   loadActiveRules,
   createRule,
   setRuleActive,
@@ -1313,6 +1323,24 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'capi_status',
+    description:
+      "Read current CAPI bridge state — pixel_id, enabled flag, event mappings, last 10 forwards. Call this when the user asks about CIO→Meta tracking, Pixel coverage, or whether the bridge is running. Read-only.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'capi_run_tick',
+    description:
+      "Force-run the CAPI polling tick now (default 30-min lookback). Returns counts (scanned, matched, forwarded, errors). No-op when bridge is disabled. Read-only effect on Supabase but does send to Meta Conversions API if matches fire — use sparingly.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        lookback_minutes: { type: 'number', description: 'How far back to scan CIO activities. Default 30.' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'list_inbox',
     description:
       "Read the real-time monitor inbox. Each open signal is a cpl_spike / zero_leads / ctr_drop / spend_velocity item. Critical and alert items already pinged the user; notice/info items sit silently here for you to review. Call this when the user asks 'what's going on right now' or before suggesting action.",
@@ -1373,6 +1401,7 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
             'audience',
             'cio_event',
             'rule',
+            'capi',
           ],
         },
         scope: {
@@ -1838,6 +1867,42 @@ async function dispatchTool(
         diagnosis,
       };
     }
+    case 'capi_status': {
+      const cfg = await getCapiConfig();
+      const maps = await listEventMap();
+      const recent = await listRecentForwards(10);
+      return {
+        config: {
+          pixel_id: cfg.pixel_id,
+          enabled: cfg.enabled,
+          default_action_source: cfg.default_action_source,
+          test_event_code: cfg.test_event_code,
+          updated_at: cfg.updated_at,
+          updated_by: cfg.updated_by_username ?? cfg.updated_by_user_id,
+        },
+        event_map: maps.map((m) => ({
+          cio_event_name: m.cio_event_name,
+          meta_event_name: m.meta_event_name,
+          action_source: m.action_source,
+          enabled: m.enabled,
+        })),
+        recent_forwards: recent.map((f) => ({
+          id: f.id,
+          created_at: f.created_at,
+          cio_event_name: f.cio_event_name,
+          meta_event_name: f.meta_event_name,
+          customer_email: f.customer_email,
+          http_status: f.http_status,
+          success: f.success,
+          error: f.error_message,
+        })),
+      };
+    }
+    case 'capi_run_tick': {
+      const lookback = (input.lookback_minutes as number | undefined) ?? 30;
+      const r = await runCapiTick({ lookbackMinutes: lookback });
+      return r;
+    }
     case 'list_inbox': {
       const onlyOpen = (input.only_open as boolean | undefined) ?? true;
       const items = onlyOpen ? await listOpenInbox(50) : await listRecentInbox(24, 100);
@@ -1909,6 +1974,192 @@ async function dispatchTool(
     default:
       throw new Error(`unknown tool: ${name}`);
   }
+}
+
+// ---------- CAPI slash command handler ----------
+
+async function handleCapiCmd(
+  chatId: number,
+  userKey: string,
+  sender: { userId?: string | null; username?: string | null },
+  args: string,
+): Promise<void> {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  const sub = (parts[0] ?? '').toLowerCase();
+
+  // Read commands first.
+  if (!sub || sub === 'status' || sub === 'show') {
+    const cfg = await getCapiConfig();
+    const maps = await listEventMap();
+    const recent = await listRecentForwards(10);
+    const lines: string[] = [];
+    lines.push(`CAPI bridge:`);
+    lines.push(`  enabled:  ${cfg.enabled ? 'YES — forwarding live' : 'no — disabled'}`);
+    lines.push(`  pixel_id: ${cfg.pixel_id ?? '(not set)'}`);
+    lines.push(`  default_action_source: ${cfg.default_action_source}`);
+    lines.push(`  test_event_code: ${cfg.test_event_code ?? '(none — production sends)'}`);
+    lines.push('');
+    if (maps.length === 0) lines.push('Event map: (empty — nothing will forward)');
+    else {
+      lines.push(`Event map (${maps.length}):`);
+      for (const m of maps) {
+        lines.push(
+          `  ${m.cio_event_name} → ${m.meta_event_name}  [${m.action_source}]${m.enabled ? '' : ' (disabled)'}`,
+        );
+      }
+    }
+    lines.push('');
+    if (recent.length === 0) lines.push('No forwards logged yet.');
+    else {
+      lines.push(`Recent forwards (${recent.length}):`);
+      for (const f of recent) {
+        const ts = f.created_at.replace('T', ' ').slice(0, 16);
+        lines.push(
+          `  ${ts}  ${f.cio_event_name}→${f.meta_event_name}  http=${f.http_status ?? '?'}  ${f.success ? 'ok' : 'FAIL'}`,
+        );
+        if (!f.success && f.error_message)
+          lines.push(`    err: ${f.error_message.slice(0, 120)}`);
+      }
+    }
+    lines.push('');
+    lines.push('Subcommands:');
+    lines.push('  /capi pixel <pixel_id>');
+    lines.push('  /capi map <cio_event> <meta_event> [action=email|website|system_generated]');
+    lines.push('  /capi unmap <cio_event>');
+    lines.push('  /capi enable | disable');
+    lines.push('  /capi test_code <code> | clear_test_code');
+    lines.push('  /capi backfill <hours>');
+    lines.push('  /capi tick — force one poll now');
+    lines.push('  /capi forwards [limit] — list recent forwards');
+    await sendChunked(chatId, lines.join('\n'));
+    return;
+  }
+
+  if (sub === 'forwards') {
+    const limit = Math.min(Math.max(parseInt(parts[1] ?? '20', 10) || 20, 1), 100);
+    const rows = await listRecentForwards(limit);
+    if (rows.length === 0) {
+      await bot.sendMessage(chatId, 'No CAPI forwards logged.');
+      return;
+    }
+    const lines: string[] = [`Recent CAPI forwards (${rows.length}):`, ''];
+    for (const f of rows) {
+      const ts = f.created_at.replace('T', ' ').slice(0, 16);
+      lines.push(
+        `#${f.id} ${ts} ${f.cio_event_name}→${f.meta_event_name} http=${f.http_status ?? '?'} ${f.success ? 'ok' : 'FAIL'}${f.customer_email ? ` ${f.customer_email}` : ''}`,
+      );
+      if (!f.success && f.error_message) lines.push(`   err: ${f.error_message.slice(0, 200)}`);
+    }
+    await sendChunked(chatId, lines.join('\n'));
+    return;
+  }
+
+  if (sub === 'tick') {
+    await bot.sendMessage(chatId, 'Running CAPI tick…');
+    try {
+      const r = await runCapiTick();
+      await bot.sendMessage(chatId, `CAPI tick: ${JSON.stringify(r)}`);
+    } catch (err) {
+      await bot.sendMessage(chatId, `CAPI tick failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return;
+  }
+
+  // Write commands — gated by `capi` permission via the pending Y/N flow.
+  // We stage a tool_action so the existing executePending path handles it.
+  // For simplicity we run write-commands inline (slash commands are explicit
+  // user authorization, like /pause).
+  const senderInfo = { userId: sender.userId ?? null, username: sender.username ?? null };
+
+  if (sub === 'pixel') {
+    const id = parts[1];
+    if (!id) {
+      await bot.sendMessage(chatId, 'Usage: /capi pixel <pixel_id>');
+      return;
+    }
+    await updateCapiConfig({ pixel_id: id }, senderInfo);
+    await bot.sendMessage(chatId, `CAPI pixel_id set to ${id}.`);
+    return;
+  }
+  if (sub === 'map') {
+    const cio = parts[1];
+    const meta = parts[2];
+    if (!cio || !meta) {
+      await bot.sendMessage(
+        chatId,
+        'Usage: /capi map <cio_event_name> <meta_event_name> [action=system_generated|email|website|chat|app]',
+      );
+      return;
+    }
+    let actionSource = 'system_generated';
+    for (const p of parts.slice(3)) {
+      if (p.startsWith('action=')) actionSource = p.slice(7);
+    }
+    const m = await upsertEventMap({ cio_event_name: cio, meta_event_name: meta, action_source: actionSource });
+    await bot.sendMessage(chatId, `Mapped: ${m.cio_event_name} → ${m.meta_event_name} [${m.action_source}]`);
+    return;
+  }
+  if (sub === 'unmap') {
+    const cio = parts[1];
+    if (!cio) {
+      await bot.sendMessage(chatId, 'Usage: /capi unmap <cio_event_name>');
+      return;
+    }
+    await deleteEventMap(cio);
+    await bot.sendMessage(chatId, `Unmapped ${cio}.`);
+    return;
+  }
+  if (sub === 'enable') {
+    const cfg = await getCapiConfig();
+    if (!cfg.pixel_id) {
+      await bot.sendMessage(chatId, "Can't enable — pixel_id is not set. Run /capi pixel <id> first.");
+      return;
+    }
+    if ((await listEventMap()).filter((m) => m.enabled).length === 0) {
+      await bot.sendMessage(chatId, "Can't enable — no enabled event mappings. Run /capi map ... first.");
+      return;
+    }
+    await updateCapiConfig({ enabled: true }, senderInfo);
+    await bot.sendMessage(chatId, 'CAPI bridge ENABLED. Polling tick will run every 10 minutes.');
+    return;
+  }
+  if (sub === 'disable') {
+    await updateCapiConfig({ enabled: false }, senderInfo);
+    await bot.sendMessage(chatId, 'CAPI bridge DISABLED.');
+    return;
+  }
+  if (sub === 'test_code') {
+    const code = parts[1];
+    if (!code) {
+      await bot.sendMessage(chatId, 'Usage: /capi test_code <code>');
+      return;
+    }
+    await updateCapiConfig({ test_event_code: code }, senderInfo);
+    await bot.sendMessage(chatId, `Test event code set: ${code}. Forwards will appear under Test Events in Events Manager.`);
+    return;
+  }
+  if (sub === 'clear_test_code') {
+    await updateCapiConfig({ test_event_code: null }, senderInfo);
+    await bot.sendMessage(chatId, 'Test event code cleared. Forwards will land in production.');
+    return;
+  }
+  if (sub === 'backfill') {
+    const hours = parseFloat(parts[1] ?? '24');
+    if (!Number.isFinite(hours) || hours <= 0) {
+      await bot.sendMessage(chatId, 'Usage: /capi backfill <hours> (e.g. 24)');
+      return;
+    }
+    void userKey;
+    await bot.sendMessage(chatId, `Running CAPI backfill for last ${hours}h… this may take a moment.`);
+    try {
+      const r = await runCapiBackfill(hours);
+      await bot.sendMessage(chatId, `Backfill done: ${JSON.stringify(r)}`);
+    } catch (err) {
+      await bot.sendMessage(chatId, `Backfill failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return;
+  }
+  await bot.sendMessage(chatId, `Unknown /capi subcommand "${sub}". Run /capi for help.`);
 }
 
 // ---------- Permission slash command handlers ----------
@@ -2491,6 +2742,13 @@ bot.on('message', async (msg) => {
               '/inbox resolve <id> [note] — dismiss an inbox item',
               '/monitor — run a monitor tick now (test)',
               '',
+              'CAPI bridge (forward CIO events → Meta Conversions API):',
+              '/capi — show status, mappings, recent forwards',
+              '/capi pixel <id>',
+              '/capi map <cio_event> <meta_event> [action=...]',
+              '/capi enable | /capi disable',
+              '/capi backfill <hours>',
+              '',
               'Or ask anything in plain English. The agent has web search, can drill into ads, save observations, set goals, and create rules.',
             ].join('\n'),
           );
@@ -2674,6 +2932,9 @@ bot.on('message', async (msg) => {
           await sendChunked(chatId, lines.join('\n'));
           return;
         }
+        case 'capi':
+          await handleCapiCmd(chatId, userKey, { userId: senderId, username: senderUsername }, args);
+          return;
         case 'monitor': {
           await bot.sendMessage(chatId, 'Running monitor tick now…');
           try {
@@ -2757,7 +3018,23 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
-  console.log(`[cron] scheduled pulse every 3h + monitor every 15m in tz=${ACCOUNT_TZ}`);
+  // Every 10 minutes — CAPI bridge tick. No-ops when disabled.
+  cron.schedule(
+    '*/10 * * * *',
+    () => {
+      console.log(`[cron] capi tick firing at ${new Date().toISOString()}`);
+      runCapiTick()
+        .then((r) =>
+          console.log(
+            `[capi] enabled=${r.enabled} scanned=${r.scanned} matched=${r.matched} forwarded=${r.forwarded} dedup=${r.skipped_dedup} errors=${r.errors}`,
+          ),
+        )
+        .catch((err) => console.error('capi tick failed:', err));
+    },
+    { timezone: ACCOUNT_TZ },
+  );
+
+  console.log(`[cron] scheduled pulse 3h + monitor 15m + capi 10m in tz=${ACCOUNT_TZ}`);
 }
 
 console.log(

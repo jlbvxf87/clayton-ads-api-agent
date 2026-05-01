@@ -11,7 +11,8 @@ export type PermissionKind =
   | 'targeting'
   | 'audience'
   | 'cio_event'
-  | 'rule';
+  | 'rule'
+  | 'capi';
 
 export const ALL_PERMISSION_KINDS: PermissionKind[] = [
   'pause',
@@ -25,6 +26,7 @@ export const ALL_PERMISSION_KINDS: PermissionKind[] = [
   'audience',
   'cio_event',
   'rule',
+  'capi',
 ];
 
 export interface PermissionScope {
