@@ -60,7 +60,7 @@ export async function checkSchemaHealth(): Promise<SchemaHealth> {
 }
 
 export function formatSchemaBanner(h: SchemaHealth): string {
-  if (h.ok) return '[MEMORY] schema OK — all 7 tables present.';
+  if (h.ok) return `[MEMORY] schema OK — all ${REQUIRED_TABLES.length} tables present.`;
   const parts: string[] = [];
   parts.push('==========================================================');
   parts.push('[MEMORY DEGRADED] Supabase schema is incomplete.');
