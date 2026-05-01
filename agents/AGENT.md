@@ -235,6 +235,36 @@ You have a permissions table, `agent_permissions`. Every WRITE tool you call is 
 - `revoke_permission` works the same way.
 - Slash commands `/pause`, `/budget`, `/boost` already have their own per-action yes/no flow and bypass the standing-order layer — those are the user's explicit one-shot authorizations.
 
+**Judgment loop (Sprint 3)**
+
+When the monitor surfaces an alert/critical signal that no standing order auto-resolves, a structured reasoning pass runs *before* the Telegram message goes out. `runJudgmentOnSignal(inbox_id)` gathers context (campaign + recent insights + ad-set breakdown + 48h of hourly snapshots + last 7d of agent_actions on this target + related observations + open cross-signal inbox + active goals), then makes ONE Anthropic call with adaptive thinking, forced to call the `submit_judgment` tool. The output — primary hypothesis, ranked alternatives, evidence cited from the data, recommendation, confidence, caveats — is saved to `agent_judgments` and rendered as the actual user-facing message.
+
+This means an alert that lands on Telegram looks like this:
+
+> [ALERT] Claya Images — cpl_spike
+>
+> Recommendation: REDUCE_BUDGET -25% (medium confidence)
+>
+> Why I think so: Frequency hit 4.2 today (vs 2.8 last week) on the top-spending ad set; CPM is also up 18%, suggesting audience saturation rather than creative fatigue.
+>
+> Evidence:
+>   • Today CPL $61 vs 7d $20 (3.0×)
+>   • Top ad set "Lookalike 1% LA" spend $87 of $103 today, freq 4.2
+>   • CPM today $42 vs 7d $35.6
+>   • CTR today 1.4% vs 7d 1.6% (only -12% — not the dominant factor)
+>
+> What would change my mind:
+>   • If a fresh creative just rotated in within the last 4h
+>   • If we have a CIO event spike at the same time (tracking issue, not perf)
+
+Per-tick budget cap is 3 judgment calls so a chaotic tick can't run up costs. Auto-act path is unchanged — it runs first; judgment only fires when no standing order covers and we're about to ping the user.
+
+You can also force a judgment manually:
+- Slash: `/judge <inbox_id>` — runs the loop and posts the rich message regardless of severity.
+- Tool: `run_judgment_on_signal({inbox_id})` — for plain-English requests like "what's actually going on with Claya Images right now?" Pull `list_inbox` first, pick the relevant id, run judgment.
+
+When the user asks open-ended diagnostic questions ("why is CPL bad on X?", "should I pause?"), the judgment tool is usually the right answer — it forces a structured, evidence-cited response rather than a free-form essay.
+
 **CAPI bridge (Sprint 2.5)**
 
 Customer.io often holds the *real* downstream signal (booking, payment, show) while Meta only sees the form-submit Pixel event. That's why Meta's optimizer is starved — it never learns which leads actually convert. The CAPI bridge forwards mapped CIO events to Meta's Conversions API as server-to-server events, deduped by `event_id=cio:{activity_id}`.

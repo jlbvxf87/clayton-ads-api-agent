@@ -137,6 +137,39 @@ create index if not exists idx_agent_actions_permission
     on agent_actions (permission_id, created_at desc)
     where permission_id is not null;
 
+-- Judgment-loop audit: every reasoning pass Clayton runs on an inbox signal.
+create table if not exists agent_judgments (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    inbox_id bigint,
+    signal_kind text,
+    target_type text,
+    target_id text,
+    target_name text,
+    primary_hypothesis text not null,
+    alternative_hypotheses jsonb not null default '[]'::jsonb,
+    evidence jsonb not null default '[]'::jsonb,
+    caveats jsonb not null default '[]'::jsonb,
+    recommended_action jsonb not null,
+    confidence text not null check (confidence in ('low','medium','high')),
+    rationale text not null,
+    surfaced_to_telegram boolean not null default false,
+    surfaced_at timestamptz,
+    acted_on boolean not null default false,
+    action_result jsonb,
+    used_permission_id bigint,
+    model text,
+    input_tokens int,
+    output_tokens int,
+    raw_llm_response jsonb
+);
+
+create index if not exists idx_agent_judgments_target
+    on agent_judgments (target_id, created_at desc) where target_id is not null;
+
+create index if not exists idx_agent_judgments_recent
+    on agent_judgments (created_at desc);
+
 -- CAPI bridge: forward CIO events to Meta Conversions API.
 create table if not exists capi_config (
     id int primary key default 1,

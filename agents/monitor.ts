@@ -14,6 +14,7 @@ import {
   recordPermissionUsage,
   type PermissionKind,
 } from './permissions.js';
+import { runJudgmentOnSignal, formatJudgmentForTelegram } from './judgment.js';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ACCOUNT_TZ = process.env.ACCOUNT_TZ ?? 'America/Los_Angeles';
@@ -393,31 +394,76 @@ async function notifyTelegram(text: string): Promise<void> {
   }
 }
 
-async function surfaceItem(inboxId: number, sig: DetectedSignal, autoActed: { acted: boolean; permId?: number; error?: string }): Promise<void> {
-  const lines: string[] = [];
+// Per-tick cap on expensive judgment-loop LLM calls so a chaotic tick can't
+// spike costs. Reset on each runMonitorTick invocation.
+const JUDGMENT_PER_TICK_CAP = 3;
+
+async function surfaceItem(
+  inboxId: number,
+  sig: DetectedSignal,
+  autoActed: { acted: boolean; permId?: number; error?: string },
+  tickJudgmentBudget: { remaining: number },
+): Promise<void> {
   if (autoActed.acted) {
-    lines.push(`${SEVERITY_PREFIX[sig.severity]} auto-resolved: ${sig.message}`);
-    lines.push(`Standing order #${autoActed.permId} covered this — paused automatically.`);
-  } else {
-    lines.push(`${SEVERITY_PREFIX[sig.severity]} ${sig.message}`);
-    if (sig.recommended_action) {
-      lines.push(
-        `Suggested: pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}.`,
-      );
-      lines.push(
-        `  Authorize once: /pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}`,
-      );
-      lines.push(
-        `  Authorize ongoing: /grant pause campaign="${sig.recommended_action.params.campaign_name}" expires=24h`,
-      );
-    }
-    lines.push(`(/inbox to see all open items, /inbox resolve ${inboxId} to dismiss)`);
+    const text = `${SEVERITY_PREFIX[sig.severity]} auto-resolved: ${sig.message}\nStanding order #${autoActed.permId} covered this — paused automatically.`;
+    await notifyTelegram(text);
+    await supabase
+      .from('agent_inbox')
+      .update({ surfaced_to_telegram: true, surfaced_at: new Date().toISOString() })
+      .eq('id', inboxId);
+    return;
   }
-  await notifyTelegram(lines.join('\n'));
+
+  // Non-auto-act path. For alert/critical with budget remaining, run the
+  // judgment loop and surface its rich output. Otherwise canned message.
+  let text: string;
+  if (
+    (sig.severity === 'critical' || sig.severity === 'alert') &&
+    tickJudgmentBudget.remaining > 0
+  ) {
+    tickJudgmentBudget.remaining -= 1;
+    try {
+      const r = await runJudgmentOnSignal(inboxId);
+      if ('error' in r) {
+        text = canonicalSurfaceText(inboxId, sig);
+      } else {
+        text = formatJudgmentForTelegram(r.judgment, sig.severity);
+        await supabase
+          .from('agent_judgments')
+          .update({ surfaced_to_telegram: true, surfaced_at: new Date().toISOString() })
+          .eq('id', r.saved_id ?? -1);
+      }
+    } catch (err) {
+      console.error('[MONITOR] judgment loop failed:', err);
+      text = canonicalSurfaceText(inboxId, sig);
+    }
+  } else {
+    text = canonicalSurfaceText(inboxId, sig);
+  }
+
+  await notifyTelegram(text);
   await supabase
     .from('agent_inbox')
     .update({ surfaced_to_telegram: true, surfaced_at: new Date().toISOString() })
     .eq('id', inboxId);
+}
+
+function canonicalSurfaceText(inboxId: number, sig: DetectedSignal): string {
+  const lines: string[] = [];
+  lines.push(`${SEVERITY_PREFIX[sig.severity]} ${sig.message}`);
+  if (sig.recommended_action) {
+    lines.push(
+      `Suggested: pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}.`,
+    );
+    lines.push(
+      `  Authorize once: /pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}`,
+    );
+    lines.push(
+      `  Authorize ongoing: /grant pause campaign="${sig.recommended_action.params.campaign_name}" expires=24h`,
+    );
+  }
+  lines.push(`(/inbox to see all open items, /inbox resolve ${inboxId} to dismiss)`);
+  return lines.join('\n');
 }
 
 function shouldSurface(sig: DetectedSignal, isNew: boolean): boolean {
@@ -444,6 +490,7 @@ export async function runMonitorTick(): Promise<{
   let newInbox = 0;
   let surfaced = 0;
   let autoActed = 0;
+  const tickJudgmentBudget = { remaining: JUDGMENT_PER_TICK_CAP };
 
   for (const sig of signals) {
     const up = await upsertInboxItem(sig);
@@ -455,13 +502,13 @@ export async function runMonitorTick(): Promise<{
     const autoActResult = await attemptAutoAction(up.id, sig);
     if (autoActResult.acted) {
       autoActed++;
-      await surfaceItem(up.id, sig, autoActResult);
+      await surfaceItem(up.id, sig, autoActResult, tickJudgmentBudget);
       surfaced++;
       continue;
     }
 
     if (shouldSurface(sig, up.isNew)) {
-      await surfaceItem(up.id, sig, autoActResult);
+      await surfaceItem(up.id, sig, autoActResult, tickJudgmentBudget);
       surfaced++;
     }
   }

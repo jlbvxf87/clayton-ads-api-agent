@@ -81,6 +81,11 @@ import {
   listRecentForwards,
 } from './capi.js';
 import {
+  runJudgmentOnSignal,
+  listRecentJudgments,
+  formatJudgmentForTelegram,
+} from './judgment.js';
+import {
   loadActiveRules,
   createRule,
   setRuleActive,
@@ -1323,6 +1328,28 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'run_judgment_on_signal',
+    description:
+      "Run a structured reasoning pass on a single open inbox signal. The judgment includes hypothesis, ranked alternatives, evidence cited from the data, recommended action, and confidence. Saves to agent_judgments. Use when the user asks 'what's actually going on with X' or to triage an inbox item before deciding to pause/budget. One Anthropic call per invocation — don't spam.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        inbox_id: { type: 'number', description: 'Inbox row to analyze (from list_inbox).' },
+      },
+      required: ['inbox_id'],
+    },
+  },
+  {
+    name: 'list_recent_judgments',
+    description:
+      "Look at recent judgment-loop outputs. Returns hypothesis + recommendation + confidence per row. Useful for the user to audit your reasoning over time.",
+    input_schema: {
+      type: 'object',
+      properties: { limit: { type: 'number' } },
+      required: [],
+    },
+  },
+  {
     name: 'capi_status',
     description:
       "Read current CAPI bridge state — pixel_id, enabled flag, event mappings, last 10 forwards. Call this when the user asks about CIO→Meta tracking, Pixel coverage, or whether the bridge is running. Read-only.",
@@ -1866,6 +1893,37 @@ async function dispatchTool(
         cio_to_meta_ratio: ratio,
         diagnosis,
       };
+    }
+    case 'run_judgment_on_signal': {
+      const id = Number(input.inbox_id);
+      if (!Number.isFinite(id) || id <= 0) return { error: 'inbox_id must be positive' };
+      const r = await runJudgmentOnSignal(id);
+      if ('error' in r) return { error: r.error };
+      return {
+        judgment_id: r.saved_id,
+        signal_kind: r.judgment.signal_kind,
+        target: r.judgment.target_name ?? r.judgment.target_id,
+        primary_hypothesis: r.judgment.primary_hypothesis,
+        alternative_hypotheses: r.judgment.alternative_hypotheses,
+        evidence: r.judgment.evidence,
+        caveats: r.judgment.caveats,
+        recommended_action: r.judgment.recommended_action,
+        confidence: r.judgment.confidence,
+        rationale: r.judgment.rationale,
+        tokens: { input: r.input_tokens, output: r.output_tokens },
+      };
+    }
+    case 'list_recent_judgments': {
+      const limit = (input.limit as number | undefined) ?? 10;
+      const items = await listRecentJudgments(limit);
+      return items.map((j) => ({
+        id: j.id,
+        signal_kind: j.signal_kind,
+        target: j.target_name ?? j.target_id,
+        recommended_action: j.recommended_action,
+        confidence: j.confidence,
+        rationale: j.rationale,
+      }));
     }
     case 'capi_status': {
       const cfg = await getCapiConfig();
@@ -2741,6 +2799,8 @@ bot.on('message', async (msg) => {
               '/inbox — open signals (cpl spike, zero leads, etc.)',
               '/inbox resolve <id> [note] — dismiss an inbox item',
               '/monitor — run a monitor tick now (test)',
+              '/judge <inbox_id> — reasoned analysis of an open signal',
+              '/judgments [N] — recent judgment trail',
               '',
               'CAPI bridge (forward CIO events → Meta Conversions API):',
               '/capi — show status, mappings, recent forwards',
@@ -2947,6 +3007,42 @@ bot.on('message', async (msg) => {
             const m = err instanceof Error ? err.message : String(err);
             await bot.sendMessage(chatId, `Monitor failed: ${m}`);
           }
+          return;
+        }
+        case 'judge': {
+          const id = Number(args.trim().split(/\s+/)[0]);
+          if (!Number.isFinite(id) || id <= 0) {
+            await bot.sendMessage(chatId, 'Usage: /judge <inbox_id> — run reasoning pass on an inbox signal.');
+            return;
+          }
+          await bot.sendChatAction(chatId, 'typing');
+          try {
+            const r = await runJudgmentOnSignal(id);
+            if ('error' in r) {
+              await bot.sendMessage(chatId, `Judgment failed: ${r.error}`);
+              return;
+            }
+            await sendChunked(chatId, formatJudgmentForTelegram(r.judgment, 'review'));
+          } catch (err) {
+            await bot.sendMessage(chatId, `Judgment crashed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          return;
+        }
+        case 'judgments': {
+          const limit = Math.min(Math.max(parseInt(args.trim() || '10', 10) || 10, 1), 50);
+          const items = await listRecentJudgments(limit);
+          if (items.length === 0) {
+            await bot.sendMessage(chatId, 'No judgments recorded yet.');
+            return;
+          }
+          const lines: string[] = [`Recent judgments (${items.length}):`, ''];
+          for (const j of items) {
+            const target = j.target_name ?? j.target_id ?? '?';
+            const action = j.recommended_action?.action ?? '?';
+            lines.push(`#${j.id} ${j.signal_kind} on ${target} → ${action} (${j.confidence})`);
+            lines.push(`   ${j.rationale.slice(0, 200)}`);
+          }
+          await sendChunked(chatId, lines.join('\n'));
           return;
         }
         case 'grant':

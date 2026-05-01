@@ -13,6 +13,7 @@ const REQUIRED_TABLES = [
   'capi_config',
   'capi_event_map',
   'capi_forwards',
+  'agent_judgments',
 ] as const;
 
 export type TableName = (typeof REQUIRED_TABLES)[number];
