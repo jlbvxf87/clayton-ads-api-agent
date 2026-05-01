@@ -335,6 +335,79 @@ export async function getAdInsights(
   });
 }
 
+// ---------- Full action-type breakdown (every action Meta records, not just leads) ----------
+
+export interface ActionRow {
+  action_type: string;
+  value: number;
+}
+
+export interface ActionBreakdown {
+  parent_id: string;
+  parent_name: string;
+  spend: number;
+  impressions: number;
+  clicks: number;
+  ctr: number | null;
+  cpm: number | null;
+  actions: ActionRow[];
+}
+
+const ACTION_BREAKDOWN_FIELDS_BY_LEVEL: Record<'campaign' | 'adset' | 'ad', string> = {
+  campaign: 'campaign_id,campaign_name,spend,impressions,clicks,ctr,cpm,actions',
+  adset: 'adset_id,adset_name,spend,impressions,clicks,ctr,cpm,actions',
+  ad: 'ad_id,ad_name,spend,impressions,clicks,ctr,cpm,actions',
+};
+
+/**
+ * Pull a full action_type breakdown over a window. Returns every action Meta
+ * records (PageView, ViewContent, AddPaymentInfo, InitiateCheckout, Lead,
+ * Purchase, custom events) per entity at the chosen level. This is what
+ * Clayton uses to answer screen/step-level questions — actions are how custom
+ * funnel events show up via the Pixel.
+ *
+ * `parentId` may be null for account-wide.
+ */
+export async function getActionBreakdown(
+  parentId: string | null,
+  level: 'campaign' | 'adset' | 'ad',
+  datePreset: DatePreset,
+  accountId?: string,
+): Promise<ActionBreakdown[]> {
+  const path = parentId ? `/${parentId}/insights` : `/${resolveAdAccount(accountId)}/insights`;
+  const rows = await paginated<Record<string, unknown>>(path, {
+    fields: ACTION_BREAKDOWN_FIELDS_BY_LEVEL[level],
+    level,
+    date_preset: datePreset,
+    limit: '500',
+  });
+  return rows.map((r) => {
+    const idKey = level === 'campaign' ? 'campaign_id' : level === 'adset' ? 'adset_id' : 'ad_id';
+    const nameKey = level === 'campaign' ? 'campaign_name' : level === 'adset' ? 'adset_name' : 'ad_name';
+    const actions = (r.actions ?? []) as Array<{ action_type: string; value: string }>;
+    return {
+      parent_id: (r[idKey] as string) ?? '',
+      parent_name: (r[nameKey] as string) ?? '',
+      spend: Number(r.spend ?? 0),
+      impressions: Number(r.impressions ?? 0),
+      clicks: Number(r.clicks ?? 0),
+      ctr: r.ctr != null ? Number(r.ctr) : null,
+      cpm: r.cpm != null ? Number(r.cpm) : null,
+      actions: actions.map((a) => ({ action_type: a.action_type, value: Number(a.value) || 0 })),
+    };
+  });
+}
+
+/**
+ * Sum a specific action across an action breakdown — useful for totals.
+ */
+export function sumAction(breakdown: ActionBreakdown[], actionType: string): number {
+  return breakdown.reduce((s, row) => {
+    const found = row.actions.find((a) => a.action_type === actionType);
+    return s + (found?.value ?? 0);
+  }, 0);
+}
+
 // ---------- Creative editing (clone-with-modifications pattern) ----------
 
 interface AdCreativeFull {
@@ -691,10 +764,13 @@ export interface PixelEventStat {
 export async function getPixelStats(
   pixelId: string,
   aggregation: 'event' | 'host' | 'browser_type' | 'pixel_fire' = 'event',
+  startUnix?: number,
+  endUnix?: number,
 ): Promise<PixelEventStat[]> {
-  const { data } = await meta.get(`/${pixelId}/stats`, {
-    params: { aggregation },
-  });
+  const params: Record<string, string> = { aggregation };
+  if (startUnix) params.start_time = String(startUnix);
+  if (endUnix) params.end_time = String(endUnix);
+  const { data } = await meta.get(`/${pixelId}/stats`, { params });
   return (data?.data ?? []) as PixelEventStat[];
 }
 
@@ -712,12 +788,24 @@ export async function getPixelHealth(pixelId?: string): Promise<PixelHealthSumma
   const pixels = pixelId ? [await getPixel(pixelId)] : await listPixels();
   const out: PixelHealthSummary[] = [];
 
+  // Default: look at the last 7 days of pixel events. Without a time range,
+  // Meta's `/stats?aggregation=event` returns aggregated lifetime data which
+  // for newer pixels is sometimes empty. Explicit recent window surfaces
+  // per-event counts reliably.
+  const now = Math.floor(Date.now() / 1000);
+  const sevenDaysAgo = now - 7 * 86400;
+
   for (const p of pixels) {
     let stats: PixelEventStat[] = [];
     try {
-      stats = await getPixelStats(p.id, 'event');
+      stats = await getPixelStats(p.id, 'event', sevenDaysAgo, now);
     } catch {
-      // some pixels don't expose stats
+      // Some pixels don't expose stats with time range; fall back to no-range
+      try {
+        stats = await getPixelStats(p.id, 'event');
+      } catch {
+        // ignore
+      }
     }
     const lastFired = p.last_fired_time ? new Date(p.last_fired_time) : null;
     const hoursSince = lastFired

@@ -24,6 +24,8 @@ import {
   setAdStatus,
   listPixels,
   getPixelHealth,
+  getActionBreakdown,
+  sumAction,
   cloneAdWithNewCopy,
   createCampaign,
   createAdSet,
@@ -59,6 +61,7 @@ import {
   cioCountEvents,
   cioShowRate,
   cioSendEvent,
+  cioDiscoverEventNames,
   CIO_CONFIGURED,
 } from './customerio.js';
 
@@ -1170,6 +1173,59 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
       required: ['customer_id', 'event_name'],
     },
   },
+  {
+    name: 'get_action_breakdown',
+    description:
+      "Pull the FULL Meta action_type breakdown over a window — every action the Pixel records, not just leads. Returns rows with spend, impressions, clicks, CTR, CPM, plus an `actions` array containing every event type Meta saw (PageView, ViewContent, AddPaymentInfo, InitiateCheckout, Lead, Purchase, custom events like IntakeStep_12). Use this whenever the user asks about funnel steps, conversion paths, or 'how many people did X' — this is the closest Meta gets to step-level visibility. parent_id is optional (omit for account-wide). level is one of 'campaign' / 'adset' / 'ad'.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        parent_id: { type: 'string', description: 'Campaign / ad set / ad ID. Omit for account-wide.' },
+        level: { type: 'string', enum: ['campaign', 'adset', 'ad'] },
+        date_preset: { type: 'string', enum: ['today', 'yesterday', 'last_7d', 'last_14d', 'last_30d'] },
+      },
+      required: ['level', 'date_preset'],
+    },
+  },
+  {
+    name: 'cio_discover_event_names',
+    description:
+      "Scan recent Customer.io activity and return every distinct event name CIO has recorded, with counts, last-seen timestamps, and sample data-payload keys. **Use this BEFORE assuming you know what events fire** — Claya's specific event vocabulary is workspace-specific and you don't know it until you check. Especially important when the user asks about funnel completion, drop-off rates, or 'how many leads booked'. Default scan window is 30 days. After running, save the discovered map as a note_observation under topic 'cio:event_names_discovered' so future calls don't have to re-scan.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        days: { type: 'integer', description: 'Days back to scan. Default 30.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'reconstruct_funnel',
+    description:
+      "Combine Meta action breakdown + CIO event counts into a step-by-step funnel report over a window. Returns: Meta spend, link clicks, landing page views, Meta-reported leads, CIO-recorded leads, CIO-recorded bookings, drop-off ratios at each step, blended CPL and CPB. **This is the right tool for any 'how is our funnel performing' question** — combines all sources, gives a real answer instead of fragments. Works even with default event names; pass overrides if cio_discover_event_names showed Claya uses different names.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        date_preset: { type: 'string', enum: ['today', 'yesterday', 'last_7d', 'last_14d', 'last_30d'] },
+        cio_lead_event_name: { type: 'string', description: 'Default "lead"' },
+        cio_booking_event_name: { type: 'string', description: 'Default "appointment_booked"' },
+      },
+      required: ['date_preset'],
+    },
+  },
+  {
+    name: 'compare_meta_vs_cio_leads',
+    description:
+      "Direct ratio of Meta-reported leads to CIO-recorded lead events over a window. Use when diagnosing whether 'lost leads' are a Pixel problem (Meta < CIO) or a funnel-completion problem (Meta > CIO). Diff > ~30% in either direction is suspicious. Returns counts, ratio, and a one-line diagnosis.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        date_preset: { type: 'string', enum: ['today', 'yesterday', 'last_7d', 'last_14d', 'last_30d'] },
+        cio_lead_event_name: { type: 'string', description: 'Default "lead"' },
+      },
+      required: ['date_preset'],
+    },
+  },
 ];
 
 async function dispatchTool(
@@ -1458,6 +1514,152 @@ async function dispatchTool(
         data: input.properties as Record<string, unknown> | undefined,
       });
       return { sent: true };
+    }
+    case 'get_action_breakdown': {
+      const level = (input.level as 'campaign' | 'adset' | 'ad') ?? 'campaign';
+      const dp = (input.date_preset as 'today' | 'yesterday' | 'last_7d' | 'last_14d' | 'last_30d') ?? 'last_7d';
+      const parentId = (input.parent_id as string | undefined) ?? null;
+      const rows = await getActionBreakdown(parentId, level, dp);
+      // Top 50 by spend to keep payload reasonable
+      const sorted = [...rows].sort((a, b) => b.spend - a.spend).slice(0, 50);
+      // Distinct action types in this slice
+      const distinctActions = new Set<string>();
+      for (const r of sorted) for (const a of r.actions) distinctActions.add(a.action_type);
+      // Account totals per action across the full result set
+      const totalsByAction: Record<string, number> = {};
+      for (const r of rows) for (const a of r.actions) totalsByAction[a.action_type] = (totalsByAction[a.action_type] ?? 0) + a.value;
+      return {
+        level,
+        window: dp,
+        entity_count: rows.length,
+        distinct_action_types: [...distinctActions].sort(),
+        totals_by_action: totalsByAction,
+        top_50_by_spend: sorted,
+      };
+    }
+    case 'cio_discover_event_names': {
+      const days = (input.days as number | undefined) ?? 30;
+      const events = await cioDiscoverEventNames(days);
+      return { window_days: days, distinct_event_count: events.length, events };
+    }
+    case 'reconstruct_funnel': {
+      const dp = (input.date_preset as 'today' | 'yesterday' | 'last_7d' | 'last_14d' | 'last_30d') ?? 'last_7d';
+      const leadName = (input.cio_lead_event_name as string | undefined) ?? 'lead';
+      const bookName = (input.cio_booking_event_name as string | undefined) ?? 'appointment_booked';
+
+      // Window seconds for CIO calls
+      const days = dp === 'today' ? 0 : dp === 'yesterday' ? 1 : Number(dp.replace('last_', '').replace('d', ''));
+      const end = Math.floor(Date.now() / 1000);
+      const start = dp === 'today'
+        ? Math.floor(new Date(new Date().setHours(0, 0, 0, 0)).getTime() / 1000)
+        : end - days * 86400;
+
+      const accountBreakdown = await getActionBreakdown(null, 'campaign', dp);
+      const totalSpend = accountBreakdown.reduce((s, r) => s + r.spend, 0);
+      const totalClicks = accountBreakdown.reduce((s, r) => s + r.clicks, 0);
+      const lpv = sumAction(accountBreakdown, 'landing_page_view');
+      const viewContent = sumAction(accountBreakdown, 'view_content');
+      const addPayment = sumAction(accountBreakdown, 'add_payment_info');
+      const initiateCheckout = sumAction(accountBreakdown, 'initiate_checkout');
+      const metaLeads = sumAction(accountBreakdown, 'lead');
+      const metaPurchases = sumAction(accountBreakdown, 'purchase');
+
+      let cioLeads = 0;
+      let cioBookings = 0;
+      let cioError: string | null = null;
+      if (CIO_CONFIGURED) {
+        try {
+          [cioLeads, cioBookings] = await Promise.all([
+            cioCountEvents(leadName, start, end),
+            cioCountEvents(bookName, start, end),
+          ]);
+        } catch (e) {
+          cioError = e instanceof Error ? e.message : String(e);
+        }
+      } else {
+        cioError = 'CIO not configured';
+      }
+
+      const cpl = metaLeads > 0 ? totalSpend / metaLeads : null;
+      const cpb = cioBookings > 0 ? totalSpend / cioBookings : null;
+      const intakeCompletionRate = lpv > 0 && cioLeads > 0 ? cioLeads / lpv : null;
+      const showRate = cioLeads > 0 ? cioBookings / cioLeads : null;
+
+      return {
+        window: dp,
+        meta: {
+          spend_dollars: Number(totalSpend.toFixed(2)),
+          link_clicks: totalClicks,
+          landing_page_views: lpv,
+          view_content: viewContent,
+          add_payment_info: addPayment,
+          initiate_checkout: initiateCheckout,
+          leads: metaLeads,
+          purchases: metaPurchases,
+        },
+        cio: {
+          configured: CIO_CONFIGURED,
+          error: cioError,
+          lead_event_name: leadName,
+          booking_event_name: bookName,
+          leads: cioLeads,
+          bookings: cioBookings,
+        },
+        ratios: {
+          intake_completion_rate: intakeCompletionRate,
+          meta_to_cio_lead_ratio: metaLeads > 0 ? cioLeads / metaLeads : null,
+          show_rate: showRate,
+        },
+        per_lead_dollars: cpl,
+        per_booking_dollars: cpb,
+        diagnosis: (() => {
+          if (totalSpend === 0) return 'No spend in window — funnel inactive.';
+          if (metaLeads === 0 && cioLeads === 0) return 'Spend with zero leads on either side — likely Pixel not firing AND no funnel completion.';
+          if (metaLeads > 0 && cioLeads === 0 && CIO_CONFIGURED) return 'Meta sees leads, CIO sees none — either tracking gap or wrong event name. Run cio_discover_event_names.';
+          if (cioLeads > metaLeads * 1.5) return 'CIO sees significantly more leads than Meta — likely a Pixel firing issue on the Meta side.';
+          if (metaLeads > cioLeads * 1.5) return 'Meta reports more leads than CIO records — likely funnel completion gap (intake started but email not captured).';
+          return 'Meta and CIO lead counts within ~50% — tracking looks consistent.';
+        })(),
+      };
+    }
+    case 'compare_meta_vs_cio_leads': {
+      const dp = (input.date_preset as 'today' | 'yesterday' | 'last_7d' | 'last_14d' | 'last_30d') ?? 'last_7d';
+      const leadName = (input.cio_lead_event_name as string | undefined) ?? 'lead';
+
+      const days = dp === 'today' ? 0 : dp === 'yesterday' ? 1 : Number(dp.replace('last_', '').replace('d', ''));
+      const end = Math.floor(Date.now() / 1000);
+      const start = dp === 'today'
+        ? Math.floor(new Date(new Date().setHours(0, 0, 0, 0)).getTime() / 1000)
+        : end - days * 86400;
+
+      const accountBreakdown = await getActionBreakdown(null, 'campaign', dp);
+      const metaLeads = sumAction(accountBreakdown, 'lead');
+      let cioLeads = 0;
+      let cioError: string | null = null;
+      if (CIO_CONFIGURED) {
+        try {
+          cioLeads = await cioCountEvents(leadName, start, end);
+        } catch (e) {
+          cioError = e instanceof Error ? e.message : String(e);
+        }
+      }
+      const ratio = metaLeads > 0 ? cioLeads / metaLeads : null;
+      const diagnosis = (() => {
+        if (metaLeads === 0 && cioLeads === 0) return 'No leads in window from either source.';
+        if (cioError) return `CIO query failed: ${cioError}`;
+        if (ratio == null) return 'Meta reports zero leads — start there.';
+        if (ratio < 0.7) return 'CIO records substantially fewer leads than Meta — funnel completion gap.';
+        if (ratio > 1.3) return 'CIO records more leads than Meta — Pixel firing issue.';
+        return 'Within ±30% — tracking consistent.';
+      })();
+      return {
+        window: dp,
+        meta_leads: metaLeads,
+        cio_leads: cioLeads,
+        cio_event_name: leadName,
+        cio_to_meta_ratio: ratio,
+        diagnosis,
+      };
     }
     default:
       throw new Error(`unknown tool: ${name}`);

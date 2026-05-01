@@ -129,21 +129,31 @@ interface ListActivitiesArgs {
 /**
  * List activities (events, attribute changes, page views) — workspace-wide
  * by default, scoped to one customer if customer_id provided.
+ *
+ * NOTE: CIO's /v1/activities does NOT accept start/end timestamp params
+ * directly (returns 400). For time windows, the caller paginates and
+ * filters client-side using activity.timestamp. Helper functions below
+ * (cioCountEvents, cioDiscoverEventNames) handle that pattern.
  */
 export async function cioListActivities(args: ListActivitiesArgs = {}): Promise<CioActivity[]> {
   const params: Record<string, string> = { limit: String(args.limit ?? 100) };
   if (args.type) params.type = args.type;
   if (args.name) params.name = args.name;
   if (args.customer_id) params.customer_id = args.customer_id;
-  if (args.start) params.start = String(args.start);
-  if (args.end) params.end = String(args.end);
+  // start/end NOT passed to the API — they trigger 400. Filter client-side.
 
   const { data } = await appClient.get('/activities', { headers: appHeaders(), params });
-  return (data?.activities ?? []) as CioActivity[];
+  let acts = (data?.activities ?? []) as CioActivity[];
+  if (args.start) acts = acts.filter((a) => (a.timestamp ?? 0) >= args.start!);
+  if (args.end) acts = acts.filter((a) => (a.timestamp ?? 0) <= args.end!);
+  return acts;
 }
 
 /**
- * Count events of a given name in a time window. Paginates if necessary.
+ * Count events of a given name in a time window. CIO's /v1/activities does
+ * NOT support start/end query params — they 400. So we paginate the global
+ * stream (newest-first) filtered by event name only, and stop once we cross
+ * the startUnix boundary. Caps at 50 pages × 1000 = 50K activities scanned.
  */
 export async function cioCountEvents(
   eventName: string,
@@ -153,21 +163,41 @@ export async function cioCountEvents(
   let total = 0;
   let next: string | undefined;
   let safety = 0;
-  do {
+  let stop = false;
+
+  while (!stop && safety < 50) {
     const params: Record<string, string> = {
       type: 'event',
       name: eventName,
-      start: String(startUnix),
-      end: String(endUnix),
       limit: '1000',
     };
     if (next) params.start_id = next;
 
-    const { data } = await appClient.get('/activities', { headers: appHeaders(), params });
-    total += (data?.activities ?? []).length;
-    next = data?.next as string | undefined;
+    let data: { activities?: CioActivity[]; next?: string } = {};
+    try {
+      const res = await appClient.get('/activities', { headers: appHeaders(), params });
+      data = res.data ?? {};
+    } catch (err) {
+      console.warn('cioCountEvents page failed:', err);
+      break;
+    }
+    const acts = data.activities ?? [];
+    if (acts.length === 0) break;
+
+    for (const a of acts) {
+      const ts = a.timestamp ?? 0;
+      if (ts < startUnix) {
+        // we've paged past the window (results are newest-first)
+        stop = true;
+        break;
+      }
+      if (ts >= startUnix && ts <= endUnix) total++;
+    }
+
+    next = data.next;
+    if (!next) break;
     safety++;
-  } while (next && safety < 50);
+  }
   return total;
 }
 
@@ -190,6 +220,80 @@ export async function cioGetCustomerActivity(
     { headers: appHeaders(), params: { limit: String(limit) } },
   );
   return (data?.activities ?? []) as CioActivity[];
+}
+
+// ---------- Discover what events actually fire ----------
+
+export interface DiscoveredEvent {
+  event_name: string;
+  count: number;
+  last_seen_iso: string | null;
+  sample_data_keys: string[];     // properties seen on the event payload
+}
+
+/**
+ * Scan recent CIO activities and aggregate distinct event names. Lets the
+ * agent answer "what events do you actually fire?" by checking, not guessing.
+ * Defaults to the last 30 days, capped at 5000 activities scanned.
+ */
+export async function cioDiscoverEventNames(days = 30, scanLimit = 5000): Promise<DiscoveredEvent[]> {
+  const start = Math.floor(Date.now() / 1000) - days * 86400;
+  const end = Math.floor(Date.now() / 1000);
+
+  let collected = 0;
+  let next: string | undefined;
+  const byName = new Map<string, { count: number; last_ts: number; keys: Set<string> }>();
+  let safety = 0;
+
+  let stop = false;
+  while (collected < scanLimit && safety < 50 && !stop) {
+    // CIO doesn't accept start/end on the activities endpoint — paginate
+    // newest-first and stop when we cross the start boundary.
+    const params: Record<string, string> = {
+      type: 'event',
+      limit: '1000',
+    };
+    if (next) params.start_id = next;
+
+    let data: { activities?: CioActivity[]; next?: string } = {};
+    try {
+      const res = await appClient.get('/activities', { headers: appHeaders(), params });
+      data = res.data ?? {};
+    } catch (err) {
+      console.warn('cioDiscoverEventNames page failed:', err);
+      break;
+    }
+    const acts = data.activities ?? [];
+    if (acts.length === 0) break;
+
+    for (const a of acts) {
+      const ts = a.timestamp ?? 0;
+      if (ts < start) {
+        stop = true;
+        break;
+      }
+      if (ts > end) continue;
+      const name = a.name ?? '(unnamed)';
+      const entry = byName.get(name) ?? { count: 0, last_ts: 0, keys: new Set<string>() };
+      entry.count += 1;
+      if (ts > entry.last_ts) entry.last_ts = ts;
+      if (a.data) for (const k of Object.keys(a.data)) entry.keys.add(k);
+      byName.set(name, entry);
+    }
+    collected += acts.length;
+    next = data.next;
+    if (!next) break;
+    safety++;
+  }
+
+  return [...byName.entries()]
+    .map(([event_name, v]) => ({
+      event_name,
+      count: v.count,
+      last_seen_iso: v.last_ts > 0 ? new Date(v.last_ts * 1000).toISOString() : null,
+      sample_data_keys: [...v.keys].slice(0, 12),
+    }))
+    .sort((a, b) => b.count - a.count);
 }
 
 // ---------- Combined: lead → booking show rate ----------
