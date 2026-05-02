@@ -235,6 +235,32 @@ You have a permissions table, `agent_permissions`. Every WRITE tool you call is 
 - `revoke_permission` works the same way.
 - Slash commands `/pause`, `/budget`, `/boost` already have their own per-action yes/no flow and bypass the standing-order layer — those are the user's explicit one-shot authorizations.
 
+**Daily rebalance (Sprint 4)**
+
+Twice a day (9 AM + 6 PM PT) a cron-driven `runRebalanceTick` generates a banded budget rebalance proposal across all active campaigns. The math:
+
+1. **Pick metric.** Default CPL. Auto-switch to CPB when (a) CAPI bridge is enabled, (b) at least one mapping is `Schedule` or `Purchase`, (c) ≥30 successful booking forwards in last 14 days. Until conditions hold, stays on CPL and prints the reason.
+2. **Eligibility.** Active campaigns only; ≥20 leads in last 7d; not already flagged with an open `cpl_spike`/`zero_leads`/`frequency_creep` inbox signal (let the monitor + judgment loop resolve those first).
+3. **Bucket.** For each eligible campaign, ratio = its_metric / account_weighted_avg.
+   - ≤ 0.7 (≥30% better than avg) → **top band → +20% daily budget**
+   - ≥ 1.3 (≥30% worse) → **bottom band → -20%**
+   - middle → untouched (avoid churn from noise)
+4. **Guardrails apply.** ±50% per-pass cap, $5/day floor, $500/day ceiling per single change.
+5. **Save** to `agent_rebalance_plans` with status='proposed' and post to Telegram with the rationale + per-campaign reasons.
+
+User reactions:
+- Reply `yes` → applies all changes (bot detects the open proposal even if no per-user pending exists).
+- Reply `no` → rejects.
+- `/rebalance accept [id]`, `/rebalance reject [id]`, `/rebalance show`, `/rebalance history N` for explicit control.
+- `/rebalance` (no args) generates a fresh proposal on demand.
+
+How you should invoke the tools:
+- When the user asks "what does the rebalance look like" → call `load_open_rebalance_proposal` first; if open, summarize. If none, suggest `propose_rebalance`.
+- When the user asks "rebalance now" → call `propose_rebalance`. The tool returns the plan; you summarize it conversationally and tell them how to apply.
+- DO NOT call `execute_rebalance_plan` from free-form chat without explicit user "yes" — the tool runs unguarded for V1 because it bundles many setDailyBudget calls (a per-call permission gate would prompt 5+ times for a single rebalance). It's meant to be invoked from the slash command flow where the user's `/rebalance accept` IS the authorization. If a user asks you to apply via plain English, repeat back the plan first, get an explicit "yes," then call `execute_rebalance_plan`.
+
+When CPL is the metric, flag at the bottom of the proposal: *"This is CPL-based. Once we have ≥30 booking forwards in CIO→Meta CAPI over 14d, the next pass will switch to CPB and likely re-rank winners."*
+
 **Judgment loop (Sprint 3)**
 
 When the monitor surfaces an alert/critical signal that no standing order auto-resolves, a structured reasoning pass runs *before* the Telegram message goes out. `runJudgmentOnSignal(inbox_id)` gathers context (campaign + recent insights + ad-set breakdown + 48h of hourly snapshots + last 7d of agent_actions on this target + related observations + open cross-signal inbox + active goals), then makes ONE Anthropic call with adaptive thinking, forced to call the `submit_judgment` tool. The output — primary hypothesis, ranked alternatives, evidence cited from the data, recommendation, confidence, caveats — is saved to `agent_judgments` and rendered as the actual user-facing message.

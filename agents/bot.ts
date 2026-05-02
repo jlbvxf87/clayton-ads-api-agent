@@ -86,6 +86,15 @@ import {
   formatJudgmentForTelegram,
 } from './judgment.js';
 import {
+  generateRebalanceProposal,
+  applyRebalancePlan,
+  rejectRebalancePlan,
+  loadOpenProposal,
+  listRecentPlans,
+  runRebalanceTick,
+  formatPlanForTelegram,
+} from './rebalance.js';
+import {
   loadActiveRules,
   createRule,
   setRuleActive,
@@ -1328,6 +1337,38 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'propose_rebalance',
+    description:
+      "Generate a fresh banded rebalance proposal. Compares each active campaign's CPL (or CPB once auto-trigger fires) to the account weighted-average. Top 30% better than avg → +20% budget; bottom 30% worse → -20%; middle untouched. Saves to agent_rebalance_plans as status='proposed'. Returns the plan with all changes. Read-write but does NOT modify Meta budgets — execute_rebalance_plan does that.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'execute_rebalance_plan',
+    description:
+      "Apply a proposed rebalance plan to Meta — sets each campaign's daily budget to the proposed value. GATED by 'budget' permission, so without a standing order the wrapper will stage a pending tool_action and ask for confirmation. Use plan_id from propose_rebalance or load_open_rebalance_proposal.",
+    input_schema: {
+      type: 'object',
+      properties: { plan_id: { type: 'number' } },
+      required: ['plan_id'],
+    },
+  },
+  {
+    name: 'load_open_rebalance_proposal',
+    description:
+      "Read the most recent proposed rebalance plan (status='proposed'). Returns null if none open. Useful when the user asks 'show me the rebalance' or 'what's pending'.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'list_rebalance_history',
+    description:
+      "List recent rebalance plans across all statuses. Useful for the user auditing what's been proposed/applied/rejected over time.",
+    input_schema: {
+      type: 'object',
+      properties: { limit: { type: 'number' } },
+      required: [],
+    },
+  },
+  {
     name: 'run_judgment_on_signal',
     description:
       "Run a structured reasoning pass on a single open inbox signal. The judgment includes hypothesis, ranked alternatives, evidence cited from the data, recommended action, and confidence. Saves to agent_judgments. Use when the user asks 'what's actually going on with X' or to triage an inbox item before deciding to pause/budget. One Anthropic call per invocation — don't spam.",
@@ -1893,6 +1934,71 @@ async function dispatchTool(
         cio_to_meta_ratio: ratio,
         diagnosis,
       };
+    }
+    case 'propose_rebalance': {
+      const plan = await generateRebalanceProposal('agent_tool');
+      return {
+        plan_id: plan.id,
+        metric: plan.metric,
+        metric_reason: plan.metric_reason,
+        account_avg_metric: plan.account_avg_metric,
+        total_daily_before: plan.total_daily_before_cents / 100,
+        total_daily_after: plan.total_daily_after_cents / 100,
+        change_count: plan.changes.length,
+        changes: plan.changes.map((c) => ({
+          campaign_name: c.campaign_name,
+          band: c.band,
+          current: c.current_daily_cents / 100,
+          proposed: c.proposed_daily_cents / 100,
+          delta_pct: c.delta_pct,
+          reason: c.reason,
+        })),
+        rationale: plan.rationale,
+      };
+    }
+    case 'execute_rebalance_plan': {
+      // NOTE: dispatchToolGuarded does NOT route this through the budget
+      // permission gate yet — the rebalance tool encompasses many setDailyBudget
+      // calls, which is wider than a single-target gate. For V1 this tool runs
+      // unguarded and is intended to be called only after a slash-command
+      // accept (which is itself the user authorization). When called via
+      // free-form, the caller should have user confirmation in this turn.
+      const id = Number(input.plan_id);
+      if (!Number.isFinite(id) || id <= 0) return { error: 'plan_id must be positive' };
+      const r = await applyRebalancePlan(id, 'agent:clayton');
+      return {
+        plan_id: id,
+        applied: r.applied,
+        failed: r.failed,
+        status: r.plan?.status,
+      };
+    }
+    case 'load_open_rebalance_proposal': {
+      const p = await loadOpenProposal();
+      if (!p) return { open: false };
+      return {
+        open: true,
+        plan_id: p.id,
+        metric: p.metric,
+        change_count: p.changes.length,
+        total_daily_before: p.total_daily_before_cents / 100,
+        total_daily_after: p.total_daily_after_cents / 100,
+        rationale: p.rationale,
+        changes: p.changes,
+      };
+    }
+    case 'list_rebalance_history': {
+      const limit = (input.limit as number | undefined) ?? 14;
+      const items = await listRecentPlans(limit);
+      return items.map((p) => ({
+        id: p.id,
+        generated_by: p.generated_by,
+        status: p.status,
+        metric: p.metric,
+        change_count: (p.changes ?? []).length,
+        total_daily_before: p.total_daily_before_cents / 100,
+        total_daily_after: p.total_daily_after_cents / 100,
+      }));
     }
     case 'run_judgment_on_signal': {
       const id = Number(input.inbox_id);
@@ -2758,6 +2864,35 @@ bot.on('message', async (msg) => {
       // unclear → fall through to Claude
     }
 
+    // No per-user pending — but check for an open rebalance proposal.
+    // Daily proposals live for ~12h until the next pass supersedes them, so
+    // they can't ride the 5-min pending Map. A bare "yes" applies the most
+    // recent proposed plan; "no" rejects it.
+    if (!text.startsWith('/')) {
+      const verdict = classifyReply(text);
+      if (verdict === 'confirm' || verdict === 'cancel') {
+        const open = await loadOpenProposal();
+        if (open && open.id != null) {
+          if (verdict === 'confirm') {
+            await bot.sendChatAction(chatId, 'typing');
+            try {
+              const r = await applyRebalancePlan(open.id, `user:${senderUsername ?? senderId ?? 'unknown'}`);
+              await bot.sendMessage(
+                chatId,
+                `Applied rebalance plan #${open.id}: ${r.applied} succeeded, ${r.failed} failed. Status=${r.plan?.status}.`,
+              );
+            } catch (err) {
+              await bot.sendMessage(chatId, `Apply failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            return;
+          }
+          await rejectRebalancePlan(open.id, `user:${senderUsername ?? senderId ?? 'unknown'}`);
+          await bot.sendMessage(chatId, `Rejected rebalance plan #${open.id}.`);
+          return;
+        }
+      }
+    }
+
     if (text.startsWith('/')) {
       const firstSpace = text.indexOf(' ');
       const cmdRaw = (firstSpace === -1 ? text.slice(1) : text.slice(1, firstSpace)).toLowerCase();
@@ -2801,6 +2936,13 @@ bot.on('message', async (msg) => {
               '/monitor — run a monitor tick now (test)',
               '/judge <inbox_id> — reasoned analysis of an open signal',
               '/judgments [N] — recent judgment trail',
+              '',
+              'Daily rebalance (9am + 6pm PT):',
+              '/rebalance — generate a fresh proposal now',
+              '/rebalance show — re-print the open proposal',
+              '/rebalance accept [id] — apply (defaults to most recent)',
+              '/rebalance reject [id] — dismiss',
+              '/rebalance history [N] — last N plans',
               '',
               'CAPI bridge (forward CIO events → Meta Conversions API):',
               '/capi — show status, mappings, recent forwards',
@@ -2995,6 +3137,76 @@ bot.on('message', async (msg) => {
         case 'capi':
           await handleCapiCmd(chatId, userKey, { userId: senderId, username: senderUsername }, args);
           return;
+        case 'rebalance': {
+          const sub = (args.trim().split(/\s+/)[0] ?? '').toLowerCase();
+          if (sub === 'history' || sub === 'log') {
+            const limit = Math.min(Math.max(parseInt(args.trim().split(/\s+/)[1] ?? '14', 10) || 14, 1), 50);
+            const items = await listRecentPlans(limit);
+            if (items.length === 0) {
+              await bot.sendMessage(chatId, 'No rebalance plans recorded.');
+              return;
+            }
+            const lines: string[] = [`Recent rebalance plans (${items.length}):`, ''];
+            for (const p of items) {
+              const ts = new Date((p as { created_at?: string }).created_at ?? '').toISOString().replace('T', ' ').slice(0, 16);
+              lines.push(
+                `#${p.id} ${ts} ${p.generated_by} metric=${p.metric} status=${p.status} changes=${(p.changes ?? []).length}`,
+              );
+            }
+            await sendChunked(chatId, lines.join('\n'));
+            return;
+          }
+          if (sub === 'accept' || sub === 'apply' || sub === 'yes') {
+            const idArg = parseInt(args.trim().split(/\s+/)[1] ?? '', 10);
+            const open = await loadOpenProposal();
+            const id = Number.isFinite(idArg) && idArg > 0 ? idArg : open?.id;
+            if (id == null) {
+              await bot.sendMessage(chatId, 'No proposed plan to apply. Run /rebalance first.');
+              return;
+            }
+            await bot.sendChatAction(chatId, 'typing');
+            try {
+              const r = await applyRebalancePlan(id, `user:${senderUsername ?? senderId ?? 'unknown'}`);
+              await bot.sendMessage(
+                chatId,
+                `Applied plan #${id}: ${r.applied} succeeded, ${r.failed} failed. Status=${r.plan?.status}.`,
+              );
+            } catch (err) {
+              await bot.sendMessage(chatId, `Apply failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            return;
+          }
+          if (sub === 'reject' || sub === 'no' || sub === 'dismiss') {
+            const idArg = parseInt(args.trim().split(/\s+/)[1] ?? '', 10);
+            const open = await loadOpenProposal();
+            const id = Number.isFinite(idArg) && idArg > 0 ? idArg : open?.id;
+            if (id == null) {
+              await bot.sendMessage(chatId, 'No proposed plan to reject.');
+              return;
+            }
+            await rejectRebalancePlan(id, `user:${senderUsername ?? senderId ?? 'unknown'}`);
+            await bot.sendMessage(chatId, `Rejected plan #${id}.`);
+            return;
+          }
+          if (sub === 'show' || sub === 'status' || sub === 'open') {
+            const open = await loadOpenProposal();
+            if (!open) {
+              await bot.sendMessage(chatId, 'No open proposal. Run /rebalance to generate one.');
+              return;
+            }
+            await sendChunked(chatId, formatPlanForTelegram(open));
+            return;
+          }
+          // No subcommand → generate a fresh proposal now.
+          await bot.sendChatAction(chatId, 'typing');
+          try {
+            const plan = await generateRebalanceProposal('manual');
+            await sendChunked(chatId, formatPlanForTelegram(plan));
+          } catch (err) {
+            await bot.sendMessage(chatId, `Rebalance failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          return;
+        }
         case 'monitor': {
           await bot.sendMessage(chatId, 'Running monitor tick now…');
           try {
@@ -3130,7 +3342,32 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
-  console.log(`[cron] scheduled pulse 3h + monitor 15m + capi 10m in tz=${ACCOUNT_TZ}`);
+  // Daily 9 AM PT — morning rebalance proposal.
+  cron.schedule(
+    '0 9 * * *',
+    () => {
+      console.log(`[cron] morning rebalance firing at ${new Date().toISOString()}`);
+      runRebalanceTick('cron_morning')
+        .then((r) => console.log(`[rebalance] morning: plan_id=${r.plan_id} changes=${r.changes} metric=${r.metric}`))
+        .catch((err) => console.error('morning rebalance failed:', err));
+    },
+    { timezone: ACCOUNT_TZ },
+  );
+  // Daily 6 PM PT — evening rebalance proposal.
+  cron.schedule(
+    '0 18 * * *',
+    () => {
+      console.log(`[cron] evening rebalance firing at ${new Date().toISOString()}`);
+      runRebalanceTick('cron_evening')
+        .then((r) => console.log(`[rebalance] evening: plan_id=${r.plan_id} changes=${r.changes} metric=${r.metric}`))
+        .catch((err) => console.error('evening rebalance failed:', err));
+    },
+    { timezone: ACCOUNT_TZ },
+  );
+
+  console.log(
+    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm in tz=${ACCOUNT_TZ}`,
+  );
 }
 
 console.log(

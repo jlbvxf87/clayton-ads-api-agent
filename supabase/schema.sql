@@ -137,6 +137,33 @@ create index if not exists idx_agent_actions_permission
     on agent_actions (permission_id, created_at desc)
     where permission_id is not null;
 
+-- Rebalance plans: daily 9 AM / 6 PM PT proposals + execution audit.
+create table if not exists agent_rebalance_plans (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    generated_by text not null check (generated_by in ('cron_morning','cron_evening','manual','agent_tool')),
+    status text not null default 'proposed'
+        check (status in ('proposed','applied','rejected','expired','superseded','partial')),
+    metric text not null check (metric in ('cpl','cpb')),
+    metric_reason text,
+    account_avg_metric numeric,
+    total_daily_before_cents bigint,
+    total_daily_after_cents bigint,
+    changes jsonb not null,
+    rationale text,
+    resolved_at timestamptz,
+    resolved_by text,
+    applied_changes jsonb,
+    error_messages jsonb,
+    notes text
+);
+
+create index if not exists idx_agent_rebalance_plans_recent
+    on agent_rebalance_plans (created_at desc);
+
+create index if not exists idx_agent_rebalance_plans_open
+    on agent_rebalance_plans (created_at desc) where status = 'proposed';
+
 -- Judgment-loop audit: every reasoning pass Clayton runs on an inbox signal.
 create table if not exists agent_judgments (
     id bigserial primary key,
