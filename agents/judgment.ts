@@ -388,13 +388,15 @@ export async function runJudgmentOnSignal(
   const ctx = await gatherContext(signal);
   const prompt = formatContextForLLM(ctx);
 
+  // forced tool_choice is incompatible with adaptive thinking; rely on the
+  // strong "you MUST emit via submit_judgment" instruction in the system
+  // prompt instead.
   const response = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 1500,
     system: JUDGMENT_SYSTEM,
     thinking: { type: 'adaptive' },
     tools: [SUBMIT_JUDGMENT_TOOL],
-    tool_choice: { type: 'tool', name: 'submit_judgment' },
     messages: [{ role: 'user', content: prompt }],
   });
 
@@ -402,7 +404,12 @@ export async function runJudgmentOnSignal(
     (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use' && b.name === 'submit_judgment',
   );
   if (!toolUse) {
-    return { error: 'LLM did not call submit_judgment tool' };
+    const textBlocks = response.content
+      .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n')
+      .slice(0, 300);
+    return { error: `LLM did not call submit_judgment. Text response: ${textBlocks || '(empty)'}` };
   }
   const j = toolUse.input as unknown as JudgmentToolInput;
 

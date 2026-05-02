@@ -288,20 +288,30 @@ export async function analyzeFirstScroll(
     : `URL: ${url}\n(No screenshot available — analyze from text only. Some visual elements like layout density and CTA color may be unknown.)\n\n--- Text content ---\n${capture.text_excerpt || '(empty)'}`;
   userBlocks.push({ type: 'text', text: textBody });
 
+  // NOTE: forced tool_choice is incompatible with adaptive thinking on the
+  // Anthropic API. With one tool registered + strong system prompt, Claude
+  // reliably calls it on its own. Same fix applies in generateRecommendations
+  // and judgment.ts.
   const response = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 1500,
     system: ANALYSIS_SYSTEM,
     thinking: { type: 'adaptive' },
     tools: [ANALYSIS_TOOL],
-    tool_choice: { type: 'tool', name: 'submit_lp_analysis' },
     messages: [{ role: 'user', content: userBlocks }],
   });
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use' && b.name === 'submit_lp_analysis',
   );
-  if (!toolUse) return { error: 'LLM did not call submit_lp_analysis tool' };
+  if (!toolUse) {
+    const textBlocks = response.content
+      .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n')
+      .slice(0, 300);
+    return { error: `LLM did not call submit_lp_analysis. Text response: ${textBlocks || '(empty)'}` };
+  }
   const a = toolUse.input as unknown as FirstScrollAnalysis;
   return {
     analysis: a,
@@ -321,8 +331,17 @@ export async function snapshotCompetitor(
     return { snapshot_id: null, analyzed: false, error: `skipped — type=${competitor.type}` };
   }
   const cap = await captureUrl(competitor.url);
+  // The screenshot being absent is NOT an error in text-only mode — only
+  // the html fetch matters for the gate. Strip the "screenshot:" prefix from
+  // cap.error so it doesn't mask real failures downstream.
+  const captureError =
+    cap.error && cap.error.startsWith('screenshot:') && cap.text_excerpt ? null : cap.error;
   if (!cap.png_base64 && !cap.text_excerpt) {
-    return { snapshot_id: null, analyzed: false, error: cap.error ?? 'capture failed (no png, no text)' };
+    return {
+      snapshot_id: null,
+      analyzed: false,
+      error: captureError ?? 'capture failed (no png, no text)',
+    };
   }
   let parsed: FirstScrollAnalysis | null = null;
   let analysis_input_tokens: number | null = null;
@@ -361,7 +380,16 @@ export async function snapshotCompetitor(
   if (error || !data) {
     return { snapshot_id: null, analyzed: parsed != null, error: error?.message ?? 'insert failed' };
   }
-  return { snapshot_id: data.id as number, analyzed: parsed != null, error: cap.error ?? analysis_error };
+  // Surface analysis_error first when present — that's the actionable failure.
+  // captureError (if any) appears as a suffix.
+  let displayError: string | null = null;
+  if (analysis_error) {
+    displayError = `analysis: ${analysis_error}`;
+    if (captureError) displayError += ` | ${captureError}`;
+  } else if (captureError) {
+    displayError = captureError;
+  }
+  return { snapshot_id: data.id as number, analyzed: parsed != null, error: displayError };
 }
 
 export interface DailyScrapeResult {
@@ -581,14 +609,20 @@ export async function generateRecommendations(): Promise<{
     system: REC_SYSTEM,
     thinking: { type: 'adaptive' },
     tools: [REC_TOOL],
-    tool_choice: { type: 'tool', name: 'submit_lp_recommendations' },
     messages: [{ role: 'user', content: prompt }],
   });
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use' && b.name === 'submit_lp_recommendations',
   );
-  if (!toolUse) return { error: 'LLM did not call submit_lp_recommendations tool' };
+  if (!toolUse) {
+    const textBlocks = response.content
+      .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n')
+      .slice(0, 300);
+    return { error: `LLM did not call submit_lp_recommendations. Text response: ${textBlocks || '(empty)'}` };
+  }
   const out = toolUse.input as unknown as { recommendations: LpRecommendation[]; summary?: string };
 
   const saved_ids: number[] = [];
