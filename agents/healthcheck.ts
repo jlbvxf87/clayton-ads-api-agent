@@ -15,6 +15,9 @@ const REQUIRED_TABLES = [
   'capi_forwards',
   'agent_judgments',
   'agent_rebalance_plans',
+  'lp_competitors',
+  'lp_snapshots',
+  'lp_recommendations',
 ] as const;
 
 export type TableName = (typeof REQUIRED_TABLES)[number];

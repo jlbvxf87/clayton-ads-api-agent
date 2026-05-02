@@ -95,6 +95,20 @@ import {
   formatPlanForTelegram,
 } from './rebalance.js';
 import {
+  listCompetitors,
+  addCompetitor,
+  removeCompetitor,
+  setCompetitorEnabled,
+  snapshotCompetitor,
+  runDailyLpTick,
+  loadLatestSnapshots,
+  generateRecommendations,
+  listRecommendations,
+  markRecommendationStatus,
+  formatRecommendationsForTelegram,
+  SCREENSHOT_AVAILABLE,
+} from './lp.js';
+import {
   loadActiveRules,
   createRule,
   setRuleActive,
@@ -1337,6 +1351,53 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'list_competitor_landing_pages',
+    description:
+      "List the competitor landing-page URLs Clayton scrapes daily. Useful when the user asks 'who are we tracking' or before recommending a new addition.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'analyze_landing_pages',
+    description:
+      "Run a fresh scrape of all enabled competitor landing pages right now (don't wait for the 8 AM cron). Returns counts and per-URL status. Use sparingly — costs roughly one Anthropic vision call per competitor.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'propose_lp_recommendations',
+    description:
+      "Generate ranked landing-page recommendations from the latest competitor analyses + Claya funnel data. Each recommendation has hypothesis, competitor evidence, Claya signal, implementation steps, and expected lift band. Saves to lp_recommendations as status='proposed'. Use when the user asks 'what should we change on the page' or after a fresh scrape.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'list_lp_recommendations',
+    description:
+      "Read open or recent landing-page recommendations.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['proposed', 'sent', 'implemented', 'measured', 'rejected', 'all'],
+        },
+        limit: { type: 'number' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'track_lp_implementation',
+    description:
+      "Mark an LP recommendation as implemented on a specific date. Used so Clayton can later compare conversion pre/post deploy. Use when the user says 'I shipped recommendation #5 yesterday' or similar.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        recommendation_id: { type: 'number' },
+        deploy_date: { type: 'string', description: 'yyyy-mm-dd. Defaults to today.' },
+      },
+      required: ['recommendation_id'],
+    },
+  },
+  {
     name: 'propose_rebalance',
     description:
       "Generate a fresh banded rebalance proposal. Compares each active campaign's CPL (or CPB once auto-trigger fires) to the account weighted-average. Top 30% better than avg → +20% budget; bottom 30% worse → -20%; middle untouched. Saves to agent_rebalance_plans as status='proposed'. Returns the plan with all changes. Read-write but does NOT modify Meta budgets — execute_rebalance_plan does that.",
@@ -1934,6 +1995,53 @@ async function dispatchTool(
         cio_to_meta_ratio: ratio,
         diagnosis,
       };
+    }
+    case 'list_competitor_landing_pages': {
+      const all = await listCompetitors(true);
+      return all.map((c) => ({
+        id: c.id,
+        url: c.url,
+        label: c.label,
+        type: c.type,
+        enabled: c.enabled,
+      }));
+    }
+    case 'analyze_landing_pages': {
+      const r = await runDailyLpTick();
+      return r;
+    }
+    case 'propose_lp_recommendations': {
+      const r = await generateRecommendations();
+      if ('error' in r) return { error: r.error };
+      return {
+        count: r.recommendations.length,
+        saved_ids: r.saved_ids,
+        recommendations: r.recommendations,
+        summary: r.summary,
+        tokens: { input: r.input_tokens, output: r.output_tokens },
+      };
+    }
+    case 'list_lp_recommendations': {
+      const status = (input.status as 'proposed' | 'sent' | 'implemented' | 'measured' | 'rejected' | 'all' | undefined) ?? 'proposed';
+      const limit = (input.limit as number | undefined) ?? 30;
+      const items = await listRecommendations(status, limit);
+      return items.map((r) => ({
+        id: r.id,
+        priority: r.priority,
+        expected_lift_band: r.expected_lift_band,
+        expected_lift_pct: r.expected_lift_pct,
+        hypothesis: r.hypothesis,
+        competitor_evidence: r.competitor_evidence,
+        claya_data_evidence: r.claya_data_evidence,
+        implementation_steps: r.implementation_steps,
+      }));
+    }
+    case 'track_lp_implementation': {
+      const id = Number(input.recommendation_id);
+      if (!Number.isFinite(id) || id <= 0) return { error: 'recommendation_id must be positive' };
+      const date = (input.deploy_date as string | undefined) ?? new Date().toISOString().slice(0, 10);
+      await markRecommendationStatus(id, 'implemented', date);
+      return { ok: true, recommendation_id: id, deploy_date: date };
     }
     case 'propose_rebalance': {
       const plan = await generateRebalanceProposal('agent_tool');
@@ -2937,6 +3045,13 @@ bot.on('message', async (msg) => {
               '/judge <inbox_id> — reasoned analysis of an open signal',
               '/judgments [N] — recent judgment trail',
               '',
+              'Landing page intelligence (8am PT scrape):',
+              '/competitors — list/add/remove competitor URLs',
+              '/lp — status of latest snapshots + open recommendations',
+              '/lp scan [url] — force scrape now',
+              '/lp recommend — generate fresh recommendations',
+              '/lp implemented <rec_id> [date] — mark a rec as deployed (lift tracking)',
+              '',
               'Daily rebalance (9am + 6pm PT):',
               '/rebalance — generate a fresh proposal now',
               '/rebalance show — re-print the open proposal',
@@ -3137,6 +3252,167 @@ bot.on('message', async (msg) => {
         case 'capi':
           await handleCapiCmd(chatId, userKey, { userId: senderId, username: senderUsername }, args);
           return;
+        case 'competitors':
+        case 'comp': {
+          const sub = (args.trim().split(/\s+/)[0] ?? '').toLowerCase();
+          if (sub === 'add') {
+            const url = args.trim().split(/\s+/)[1];
+            const label = args.trim().split(/\s+/).slice(2).join(' ');
+            if (!url) {
+              await bot.sendMessage(chatId, 'Usage: /competitors add <url> [label]');
+              return;
+            }
+            try {
+              const c = await addCompetitor({ url, label: label || undefined });
+              await bot.sendMessage(chatId, `Added competitor #${c.id}: ${c.url}${c.label ? ' (' + c.label + ')' : ''}`);
+            } catch (err) {
+              await bot.sendMessage(chatId, `Add failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            return;
+          }
+          if (sub === 'remove' || sub === 'rm') {
+            const id = Number(args.trim().split(/\s+/)[1]);
+            if (!Number.isFinite(id) || id <= 0) {
+              await bot.sendMessage(chatId, 'Usage: /competitors remove <id>');
+              return;
+            }
+            await removeCompetitor(id);
+            await bot.sendMessage(chatId, `Removed competitor #${id}.`);
+            return;
+          }
+          if (sub === 'enable' || sub === 'disable') {
+            const id = Number(args.trim().split(/\s+/)[1]);
+            if (!Number.isFinite(id) || id <= 0) {
+              await bot.sendMessage(chatId, `Usage: /competitors ${sub} <id>`);
+              return;
+            }
+            await setCompetitorEnabled(id, sub === 'enable');
+            await bot.sendMessage(chatId, `${sub}d competitor #${id}.`);
+            return;
+          }
+          // default: list
+          const all = await listCompetitors(true);
+          if (all.length === 0) {
+            await bot.sendMessage(chatId, 'No competitors. Add via /competitors add <url> [label]');
+            return;
+          }
+          const lines: string[] = [`Competitors (${all.length}):`, ''];
+          for (const c of all) {
+            lines.push(
+              `#${c.id} ${c.enabled ? '✓' : '✗'} ${c.url}${c.label ? ' — ' + c.label : ''}${c.type !== 'landing_page' ? ` [${c.type}]` : ''}`,
+            );
+          }
+          await sendChunked(chatId, lines.join('\n'));
+          return;
+        }
+        case 'lp': {
+          const sub = (args.trim().split(/\s+/)[0] ?? '').toLowerCase();
+          if (sub === 'scan') {
+            const targetUrl = args.trim().split(/\s+/)[1];
+            if (targetUrl) {
+              await bot.sendMessage(chatId, `Scraping ${targetUrl}…`);
+              const all = await listCompetitors(true);
+              const c = all.find((x) => x.url === targetUrl || String(x.id) === targetUrl);
+              if (!c) {
+                await bot.sendMessage(chatId, 'Not in competitor list. Add it first via /competitors add <url>');
+                return;
+              }
+              const r = await snapshotCompetitor(c, 'manual');
+              await bot.sendMessage(
+                chatId,
+                `Snapshot ${r.snapshot_id ?? 'failed'} — analyzed=${r.analyzed}${r.error ? ' err=' + r.error : ''}`,
+              );
+              return;
+            }
+            await bot.sendMessage(chatId, 'Running full LP scrape (may take 1-2 min)…');
+            try {
+              const r = await runDailyLpTick();
+              await bot.sendMessage(
+                chatId,
+                `Scrape: ${r.succeeded}/${r.total} succeeded, ${r.analyzed} analyzed, ${r.failed} failed.`,
+              );
+            } catch (err) {
+              await bot.sendMessage(chatId, `Scrape failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            return;
+          }
+          if (sub === 'recommend' || sub === 'recommendations' || sub === 'recs') {
+            const sub2 = args.trim().split(/\s+/)[1]?.toLowerCase();
+            if (sub2 === 'list') {
+              const recs = await listRecommendations('proposed');
+              await sendChunked(chatId, formatRecommendationsForTelegram(recs));
+              return;
+            }
+            await bot.sendMessage(chatId, 'Generating recommendations from latest snapshots…');
+            try {
+              const r = await generateRecommendations();
+              if ('error' in r) {
+                await bot.sendMessage(chatId, r.error);
+                return;
+              }
+              const lines = [`Generated ${r.recommendations.length} recommendations:`, ''];
+              lines.push(formatRecommendationsForTelegram(r.recommendations, r.summary));
+              await sendChunked(chatId, lines.join('\n'));
+            } catch (err) {
+              await bot.sendMessage(chatId, `Recommendations failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            return;
+          }
+          if (sub === 'implemented') {
+            const id = Number(args.trim().split(/\s+/)[1]);
+            const date = args.trim().split(/\s+/)[2] ?? new Date().toISOString().slice(0, 10);
+            if (!Number.isFinite(id) || id <= 0) {
+              await bot.sendMessage(chatId, 'Usage: /lp implemented <recommendation_id> [yyyy-mm-dd]');
+              return;
+            }
+            await markRecommendationStatus(id, 'implemented', date);
+            await bot.sendMessage(chatId, `Marked recommendation #${id} as implemented on ${date}.`);
+            return;
+          }
+          if (sub === 'reject') {
+            const id = Number(args.trim().split(/\s+/)[1]);
+            if (!Number.isFinite(id) || id <= 0) {
+              await bot.sendMessage(chatId, 'Usage: /lp reject <recommendation_id>');
+              return;
+            }
+            await markRecommendationStatus(id, 'rejected');
+            await bot.sendMessage(chatId, `Rejected recommendation #${id}.`);
+            return;
+          }
+          // default: status — most recent snapshots + open recs
+          const snaps = await loadLatestSnapshots();
+          const recs = await listRecommendations('proposed', 10);
+          const lines: string[] = [];
+          lines.push(`LP intelligence — screenshot service ${SCREENSHOT_AVAILABLE ? 'configured' : 'NOT configured (text-only)'}`);
+          lines.push('');
+          lines.push(`Latest snapshots (${snaps.length}):`);
+          for (const s of snaps.slice(0, 12)) {
+            const a = s.parsed_structure;
+            const ts = s.captured_at.replace('T', ' ').slice(0, 16);
+            lines.push(
+              `  ${ts} ${s.label ?? s.url}${a ? ` — "${(a.hero_headline ?? '?').slice(0, 60)}"` : ' (analysis unavailable)'}`,
+            );
+          }
+          lines.push('');
+          if (recs.length === 0) {
+            lines.push('No open recommendations. Run /lp recommend to generate.');
+          } else {
+            lines.push(`Open recommendations (${recs.length}):`);
+            for (const r of recs.slice(0, 6)) {
+              lines.push(`  #${r.id} P${r.priority} (${r.expected_lift_band}) — ${r.hypothesis.slice(0, 100)}`);
+            }
+          }
+          lines.push('');
+          lines.push('Subcommands:');
+          lines.push('  /lp scan [url] — force scrape now (all, or one URL/id)');
+          lines.push('  /lp recommend — generate fresh recommendations');
+          lines.push('  /lp recommend list — list open recommendations');
+          lines.push('  /lp implemented <rec_id> [yyyy-mm-dd] — mark deployed');
+          lines.push('  /lp reject <rec_id>');
+          lines.push('  /competitors — manage the competitor list');
+          await sendChunked(chatId, lines.join('\n'));
+          return;
+        }
         case 'rebalance': {
           const sub = (args.trim().split(/\s+/)[0] ?? '').toLowerCase();
           if (sub === 'history' || sub === 'log') {
@@ -3365,8 +3641,22 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
+  // Daily 8 AM PT — LP intelligence scrape (competitor first-scrolls).
+  cron.schedule(
+    '0 8 * * *',
+    () => {
+      console.log(`[cron] LP scrape firing at ${new Date().toISOString()}`);
+      runDailyLpTick()
+        .then((r) =>
+          console.log(`[lp] scraped ${r.succeeded}/${r.total} analyzed=${r.analyzed} failed=${r.failed}`),
+        )
+        .catch((err) => console.error('LP scrape failed:', err));
+    },
+    { timezone: ACCOUNT_TZ },
+  );
+
   console.log(
-    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm in tz=${ACCOUNT_TZ}`,
+    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm + lp 8am in tz=${ACCOUNT_TZ}`,
   );
 }
 
