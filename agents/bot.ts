@@ -3328,8 +3328,14 @@ bot.on('message', async (msg) => {
         case 'lp': {
           const sub = (args.trim().split(/\s+/)[0] ?? '').toLowerCase();
           if (sub === 'scan') {
-            const targetUrl = args.trim().split(/\s+/)[1];
-            if (targetUrl) {
+            // Only treat the next token as a target if it actually looks like
+            // a URL or a numeric competitor id. Anything else (stray words
+            // copy-pasted from instructions, etc.) → fall back to full scan.
+            const second = args.trim().split(/\s+/)[1];
+            const isUrl = second && /^https?:\/\//i.test(second);
+            const isId = second && /^\d+$/.test(second);
+            if (isUrl || isId) {
+              const targetUrl = second!;
               await bot.sendMessage(chatId, `Scraping ${targetUrl}…`);
               const all = await listCompetitors(true);
               const c = all.find((x) => x.url === targetUrl || String(x.id) === targetUrl);
