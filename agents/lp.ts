@@ -330,12 +330,44 @@ export async function analyzeFirstScroll(
       .slice(0, 300);
     return { error: `LLM did not call submit_lp_analysis. Text response: ${textBlocks || '(empty)'}` };
   }
-  const a = toolUse.input as unknown as FirstScrollAnalysis;
+  const a = normalizeFirstScrollAnalysis(toolUse.input as Partial<FirstScrollAnalysis>);
   return {
     analysis: a,
     input_tokens: response.usage?.input_tokens ?? 0,
     output_tokens: response.usage?.output_tokens ?? 0,
     raw: response,
+  };
+}
+
+// Claude sometimes omits optional array fields from the tool input when a
+// page has none of that thing (e.g., no urgency elements). Normalize so
+// downstream code can rely on arrays existing.
+function normalizeFirstScrollAnalysis(raw: Partial<FirstScrollAnalysis>): FirstScrollAnalysis {
+  const arr = (v: unknown): string[] => (Array.isArray(v) ? (v as string[]).filter((x) => typeof x === 'string') : []);
+  return {
+    hero_headline: typeof raw.hero_headline === 'string' ? raw.hero_headline : null,
+    subhead: typeof raw.subhead === 'string' ? raw.subhead : null,
+    primary_cta: raw.primary_cta && typeof raw.primary_cta === 'object'
+      ? {
+          copy: typeof raw.primary_cta.copy === 'string' ? raw.primary_cta.copy : '',
+          position: (raw.primary_cta.position === 'top' || raw.primary_cta.position === 'middle' || raw.primary_cta.position === 'bottom')
+            ? raw.primary_cta.position
+            : 'middle',
+          color_hint: typeof raw.primary_cta.color_hint === 'string' ? raw.primary_cta.color_hint : null,
+        }
+      : null,
+    secondary_cta: typeof raw.secondary_cta === 'string' ? raw.secondary_cta : null,
+    bullets: arr(raw.bullets),
+    social_proof: arr(raw.social_proof),
+    badges: arr(raw.badges),
+    urgency_elements: arr(raw.urgency_elements),
+    pricing_visible: typeof raw.pricing_visible === 'string' ? raw.pricing_visible : null,
+    payment_options: arr(raw.payment_options),
+    cta_layout: (raw.cta_layout === 'single' || raw.cta_layout === 'multiple' || raw.cta_layout === 'sticky_bottom' || raw.cta_layout === 'navigation_only')
+      ? raw.cta_layout
+      : 'navigation_only',
+    visual_style: typeof raw.visual_style === 'string' ? raw.visual_style : 'unknown',
+    observed_patterns: arr(raw.observed_patterns),
   };
 }
 
@@ -557,12 +589,18 @@ async function gatherClayaFunnelContext(): Promise<ClayaFunnelContext> {
 function summarizeAnalyses(snaps: LatestSnapshot[]): string {
   const lines: string[] = [];
   for (const s of snaps) {
-    const a = s.parsed_structure;
-    if (!a) {
+    const raw = s.parsed_structure;
+    if (!raw) {
       lines.push(`- ${s.label ?? s.url}: (analysis unavailable)`);
       continue;
     }
-    const cta = a.primary_cta ? `"${a.primary_cta.copy}" (${a.primary_cta.position}${a.primary_cta.color_hint ? ', ' + a.primary_cta.color_hint : ''})` : '(none seen)';
+    // Belt-and-suspenders: existing rows in lp_snapshots may pre-date the
+    // analysis-output normalizer. Re-normalize here so Optional array fields
+    // can never crash downstream.
+    const a = normalizeFirstScrollAnalysis(raw);
+    const cta = a.primary_cta
+      ? `"${a.primary_cta.copy}" (${a.primary_cta.position}${a.primary_cta.color_hint ? ', ' + a.primary_cta.color_hint : ''})`
+      : '(none seen)';
     lines.push(`- ${s.label ?? s.url}`);
     lines.push(`    headline: "${a.hero_headline ?? '?'}"`);
     if (a.subhead) lines.push(`    subhead: "${a.subhead}"`);
