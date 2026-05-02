@@ -180,6 +180,23 @@ export async function getCampaignInsights(datePreset: DatePreset): Promise<Campa
   });
 }
 
+/**
+ * Pull campaign insights for an arbitrary date window. Used by the
+ * lift-measurement loop to compare 14d-pre vs 14d-post landing-page
+ * deploys.
+ */
+export async function getCampaignInsightsRange(
+  sinceIso: string, // 'YYYY-MM-DD'
+  untilIso: string, // 'YYYY-MM-DD' (inclusive)
+): Promise<CampaignInsight[]> {
+  return paginated<CampaignInsight>(`/${AD_ACCOUNT}/insights`, {
+    fields: INSIGHT_FIELDS,
+    level: 'campaign',
+    time_range: JSON.stringify({ since: sinceIso, until: untilIso }),
+    limit: '500',
+  });
+}
+
 const LEAD_ACTION_TYPES = new Set([
   'lead',
   'onsite_conversion.lead_grouped',

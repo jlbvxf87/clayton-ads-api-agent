@@ -3,7 +3,7 @@ import axios from 'axios';
 import Anthropic from '@anthropic-ai/sdk';
 import TelegramBot from 'node-telegram-bot-api';
 import { supabase } from './supabase.js';
-import { getCampaignInsights, getActionBreakdown, extractLeads } from './meta.js';
+import { getCampaignInsights, getCampaignInsightsRange, getActionBreakdown, extractLeads } from './meta.js';
 import { cioCountEvents, cioDiscoverEventNames, CIO_CONFIGURED } from './customerio.js';
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
@@ -25,6 +25,7 @@ export interface Competitor {
   label: string | null;
   type: 'landing_page' | 'ad_library' | 'blog' | 'other';
   enabled: boolean;
+  is_own_property: boolean;
   notes: string | null;
   created_at: string;
 }
@@ -83,6 +84,7 @@ export async function addCompetitor(args: {
   url: string;
   label?: string;
   type?: Competitor['type'];
+  is_own_property?: boolean;
   notes?: string;
 }): Promise<Competitor> {
   const { data, error } = await supabase
@@ -92,6 +94,7 @@ export async function addCompetitor(args: {
         url: args.url,
         label: args.label ?? null,
         type: args.type ?? 'landing_page',
+        is_own_property: args.is_own_property ?? false,
         notes: args.notes ?? null,
         enabled: true,
       },
@@ -385,9 +388,11 @@ export async function runDailyScrape(): Promise<DailyScrapeResult> {
 
 // ---------- Most-recent-per-competitor read ----------
 
-export async function loadLatestSnapshots(): Promise<Array<SnapshotRow & { label: string | null }>> {
+type LatestSnapshot = SnapshotRow & { label: string | null; is_own_property: boolean };
+
+export async function loadLatestSnapshots(): Promise<LatestSnapshot[]> {
   const competitors = await listCompetitors(false);
-  const out: Array<SnapshotRow & { label: string | null }> = [];
+  const out: LatestSnapshot[] = [];
   for (const c of competitors) {
     const { data } = await supabase
       .from('lp_snapshots')
@@ -396,7 +401,12 @@ export async function loadLatestSnapshots(): Promise<Array<SnapshotRow & { label
       .order('captured_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    if (data) out.push({ ...(data as SnapshotRow), label: c.label });
+    if (data)
+      out.push({
+        ...(data as SnapshotRow),
+        label: c.label,
+        is_own_property: c.is_own_property,
+      });
   }
   return out;
 }
@@ -498,7 +508,7 @@ async function gatherClayaFunnelContext(): Promise<ClayaFunnelContext> {
   return { cio_event_summary, meta_today_total_leads, meta_today_actions: meta_today_actions.slice(0, 10) };
 }
 
-function summarizeAnalyses(snaps: Array<SnapshotRow & { label: string | null }>): string {
+function summarizeAnalyses(snaps: LatestSnapshot[]): string {
   const lines: string[] = [];
   for (const s of snaps) {
     const a = s.parsed_structure;
@@ -535,10 +545,24 @@ export async function generateRecommendations(): Promise<{
   if (usable.length === 0) {
     return { error: 'No analyzed snapshots yet — run /lp scan first.' };
   }
+  const own = usable.filter((s) => s.is_own_property);
+  const competitors = usable.filter((s) => !s.is_own_property);
+
   const claya = await gatherClayaFunnelContext();
-  const competitorBlock = summarizeAnalyses(snaps);
+
+  const ownBlock =
+    own.length === 0
+      ? `(no own-property pages tracked — add claya.com via /competitors add and mark is_own_property=true so this section auto-populates from a real scrape, not a hardcoded description)`
+      : summarizeAnalyses(own);
+  const competitorBlock =
+    competitors.length === 0
+      ? '(no competitor snapshots yet)'
+      : summarizeAnalyses(competitors);
 
   const prompt = [
+    `# Claya / own-property pages (latest scrape)`,
+    ownBlock,
+    '',
     `# Competitor first-scroll analyses (most recent per URL)`,
     competitorBlock,
     '',
@@ -548,14 +572,7 @@ export async function generateRecommendations(): Promise<{
     `Meta last_7d action types (top 10):`,
     ...claya.meta_today_actions.map((a) => `  ${a.action_type}: ${a.count}`),
     '',
-    `# Claya page (claya.com) — what we know`,
-    `Headline: "Finally serious about weight loss? So are we. Fat loss made easy with personalized care and GLP-1 medication"`,
-    `Primary CTA: "Am I Qualified?" (qualification framing)`,
-    `Bullets: 5 (lose pounds weekly, money-back, no membership, $179 no-insurance, HSA/FSA)`,
-    `Trust stack: Trustpilot, BBB, HIPAA, LegitScript`,
-    `Pricing visible: $179 in bullet 4`,
-    '',
-    `Produce 3-7 ranked recommendations Claya should test next, grounded in the competitor patterns and the Claya signal above.`,
+    `Produce 3-7 ranked recommendations Claya should test next, grounded in real differences between the own-property block and the competitor patterns + Claya's funnel signal. Cite specific competitor URLs when comparing.`,
   ].join('\n');
 
   const response = await anthropic.messages.create({
@@ -681,6 +698,187 @@ async function notifyTelegram(text: string): Promise<void> {
       console.error('[LP] telegram send failed:', err);
     }
   }
+}
+
+// ---------- Lift measurement (closed loop) ----------
+//
+// Once a recommendation is shipped (status='implemented' + deploy_date set),
+// we wait 14 days then compare Claya's account-level lead-rate
+// (leads / link_clicks) for the 14 days BEFORE deploy vs the 14 days AFTER.
+// Lift on lead_rate isolates page-side improvements from ad-side changes
+// (CTR shifts are ad-side; lead_rate shifts are page-side).
+
+interface LiftWindow {
+  since: string;
+  until: string;
+  leads: number;
+  clicks: number;
+  spend: number;
+  lead_rate_pct: number | null;
+  cpl: number | null;
+}
+
+interface LiftResult {
+  pre: LiftWindow;
+  post: LiftWindow;
+  lift_lead_rate_pct: number | null;
+  lift_cpl_pct: number | null;
+  confound_warning: string | null;
+}
+
+function isoDate(d: Date): string {
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+async function computeWindow(sinceIso: string, untilIso: string): Promise<LiftWindow> {
+  const insights = await getCampaignInsightsRange(sinceIso, untilIso);
+  let leads = 0;
+  let clicks = 0;
+  let spend = 0;
+  for (const i of insights) {
+    leads += extractLeads(i);
+    clicks += i.clicks ? Number(i.clicks) : 0;
+    spend += i.spend ? Number(i.spend) : 0;
+  }
+  const lead_rate_pct = clicks > 0 ? (leads / clicks) * 100 : null;
+  const cpl = leads > 0 ? spend / leads : null;
+  return { since: sinceIso, until: untilIso, leads, clicks, spend, lead_rate_pct, cpl };
+}
+
+async function countAgentActionsInWindow(sinceIso: string, untilIso: string): Promise<number> {
+  const { count, error } = await supabase
+    .from('agent_actions')
+    .select('id', { count: 'exact', head: true })
+    .gte('created_at', sinceIso)
+    .lte('created_at', untilIso + 'T23:59:59Z')
+    .eq('success', true);
+  if (error) {
+    console.warn('[LP-LIFT] agent_actions count failed:', error.message);
+    return 0;
+  }
+  return count ?? 0;
+}
+
+export async function measureLpLift(recId: number): Promise<LiftResult | { error: string }> {
+  const { data: rec, error } = await supabase
+    .from('lp_recommendations')
+    .select('*')
+    .eq('id', recId)
+    .single();
+  if (error || !rec) return { error: error?.message ?? 'recommendation not found' };
+  if (!rec.deploy_date) return { error: 'deploy_date not set on this recommendation' };
+
+  const deploy = new Date(rec.deploy_date as string);
+  const preStart = new Date(deploy);
+  preStart.setUTCDate(preStart.getUTCDate() - 14);
+  const preEnd = new Date(deploy);
+  preEnd.setUTCDate(preEnd.getUTCDate() - 1);
+  const postStart = new Date(deploy);
+  postStart.setUTCDate(postStart.getUTCDate() + 1);
+  const postEnd = new Date(deploy);
+  postEnd.setUTCDate(postEnd.getUTCDate() + 14);
+
+  const [pre, post] = await Promise.all([
+    computeWindow(isoDate(preStart), isoDate(preEnd)),
+    computeWindow(isoDate(postStart), isoDate(postEnd)),
+  ]);
+
+  const lift_lead_rate_pct =
+    pre.lead_rate_pct != null && post.lead_rate_pct != null && pre.lead_rate_pct > 0
+      ? ((post.lead_rate_pct - pre.lead_rate_pct) / pre.lead_rate_pct) * 100
+      : null;
+  const lift_cpl_pct =
+    pre.cpl != null && post.cpl != null && pre.cpl > 0 ? ((post.cpl - pre.cpl) / pre.cpl) * 100 : null;
+
+  // Confound check: count successful agent_actions in the post window
+  // (rebalances, pauses, budget changes). Many actions = noisy signal.
+  const postActionCount = await countAgentActionsInWindow(isoDate(postStart), isoDate(postEnd));
+  let confound_warning: string | null = null;
+  if (postActionCount >= 3) {
+    confound_warning = `${postActionCount} successful agent_actions during the post window — ad-side changes may confound the page-side reading.`;
+  }
+
+  await supabase
+    .from('lp_recommendations')
+    .update({
+      pre_deploy_baseline: pre,
+      post_deploy_lift: { ...post, lift_lead_rate_pct, lift_cpl_pct, confound_warning },
+      status: 'measured',
+    })
+    .eq('id', recId);
+
+  return { pre, post, lift_lead_rate_pct, lift_cpl_pct, confound_warning };
+}
+
+export interface LiftMeasurementTickResult {
+  considered: number;
+  measured: number;
+  errors: number;
+  details: Array<{ id: number; ok: boolean; lift_lead_rate_pct: number | null; error?: string }>;
+}
+
+export async function runLiftMeasurementTick(): Promise<LiftMeasurementTickResult> {
+  // Find implemented recs whose deploy_date + 14 days has passed.
+  const cutoff = new Date();
+  cutoff.setUTCDate(cutoff.getUTCDate() - 14);
+  const cutoffIso = isoDate(cutoff);
+
+  const { data, error } = await supabase
+    .from('lp_recommendations')
+    .select('id, hypothesis, deploy_date, status')
+    .eq('status', 'implemented')
+    .lte('deploy_date', cutoffIso);
+  if (error) {
+    console.error('[LP-LIFT] tick query failed:', error.message);
+    return { considered: 0, measured: 0, errors: 1, details: [] };
+  }
+  const out: LiftMeasurementTickResult = {
+    considered: data?.length ?? 0,
+    measured: 0,
+    errors: 0,
+    details: [],
+  };
+  for (const rec of data ?? []) {
+    try {
+      const r = await measureLpLift(rec.id as number);
+      if ('error' in r) {
+        out.errors++;
+        out.details.push({ id: rec.id as number, ok: false, lift_lead_rate_pct: null, error: r.error });
+        continue;
+      }
+      out.measured++;
+      out.details.push({ id: rec.id as number, ok: true, lift_lead_rate_pct: r.lift_lead_rate_pct });
+      // Notify Telegram with the result.
+      const dir = r.lift_lead_rate_pct == null
+        ? 'inconclusive'
+        : r.lift_lead_rate_pct > 0
+          ? `+${r.lift_lead_rate_pct.toFixed(1)}% lift`
+          : `${r.lift_lead_rate_pct.toFixed(1)}% drop`;
+      const lines: string[] = [];
+      lines.push(`Recommendation #${rec.id} measured (14-day post-deploy):`);
+      lines.push(`  hypothesis: ${(rec.hypothesis as string).slice(0, 140)}`);
+      lines.push(`  pre lead_rate: ${r.pre.lead_rate_pct != null ? r.pre.lead_rate_pct.toFixed(2) + '%' : 'n/a'} (${r.pre.leads} leads / ${r.pre.clicks} clicks)`);
+      lines.push(`  post lead_rate: ${r.post.lead_rate_pct != null ? r.post.lead_rate_pct.toFixed(2) + '%' : 'n/a'} (${r.post.leads} leads / ${r.post.clicks} clicks)`);
+      lines.push(`  result: ${dir}`);
+      if (r.lift_cpl_pct != null) {
+        lines.push(`  CPL change: ${r.lift_cpl_pct >= 0 ? '+' : ''}${r.lift_cpl_pct.toFixed(1)}%`);
+      }
+      if (r.confound_warning) lines.push(`  caveat: ${r.confound_warning}`);
+      await notifyTelegram(lines.join('\n'));
+    } catch (err) {
+      out.errors++;
+      out.details.push({
+        id: rec.id as number,
+        ok: false,
+        lift_lead_rate_pct: null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return out;
 }
 
 // ---------- Cron entry point ----------

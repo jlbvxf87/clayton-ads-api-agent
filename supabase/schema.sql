@@ -146,8 +146,12 @@ create table if not exists lp_competitors (
     type text not null default 'landing_page'
         check (type in ('landing_page','ad_library','blog','other')),
     enabled boolean not null default true,
+    is_own_property boolean not null default false,
     notes text
 );
+
+create index if not exists idx_lp_competitors_own
+    on lp_competitors (created_at desc) where is_own_property = true;
 
 create table if not exists lp_snapshots (
     id bigserial primary key,

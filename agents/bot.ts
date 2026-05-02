@@ -107,6 +107,8 @@ import {
   markRecommendationStatus,
   formatRecommendationsForTelegram,
   SCREENSHOT_AVAILABLE,
+  runLiftMeasurementTick,
+  measureLpLift,
 } from './lp.js';
 import {
   loadActiveRules,
@@ -1398,6 +1400,16 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'measure_lp_lift',
+    description:
+      "Force the pre/post conversion comparison for one implemented LP recommendation. Compares Claya's account-level lead_rate (leads/link_clicks) and CPL for the 14 days BEFORE deploy_date vs the 14 days AFTER. Marks status='measured' and writes the result to lp_recommendations. Auto-runs daily via cron at 7am PT for any rec past its 14-day soak — use this tool when the user wants to check sooner.",
+    input_schema: {
+      type: 'object',
+      properties: { recommendation_id: { type: 'number' } },
+      required: ['recommendation_id'],
+    },
+  },
+  {
     name: 'propose_rebalance',
     description:
       "Generate a fresh banded rebalance proposal. Compares each active campaign's CPL (or CPB once auto-trigger fires) to the account weighted-average. Top 30% better than avg → +20% budget; bottom 30% worse → -20%; middle untouched. Saves to agent_rebalance_plans as status='proposed'. Returns the plan with all changes. Read-write but does NOT modify Meta budgets — execute_rebalance_plan does that.",
@@ -2042,6 +2054,13 @@ async function dispatchTool(
       const date = (input.deploy_date as string | undefined) ?? new Date().toISOString().slice(0, 10);
       await markRecommendationStatus(id, 'implemented', date);
       return { ok: true, recommendation_id: id, deploy_date: date };
+    }
+    case 'measure_lp_lift': {
+      const id = Number(input.recommendation_id);
+      if (!Number.isFinite(id) || id <= 0) return { error: 'recommendation_id must be positive' };
+      const r = await measureLpLift(id);
+      if ('error' in r) return r;
+      return r;
     }
     case 'propose_rebalance': {
       const plan = await generateRebalanceProposal('agent_tool');
@@ -3045,12 +3064,13 @@ bot.on('message', async (msg) => {
               '/judge <inbox_id> — reasoned analysis of an open signal',
               '/judgments [N] — recent judgment trail',
               '',
-              'Landing page intelligence (8am PT scrape):',
+              'Landing page intelligence (Mondays 8am PT scrape):',
               '/competitors — list/add/remove competitor URLs',
               '/lp — status of latest snapshots + open recommendations',
               '/lp scan [url] — force scrape now',
               '/lp recommend — generate fresh recommendations',
               '/lp implemented <rec_id> [date] — mark a rec as deployed (lift tracking)',
+              '/lp measure <rec_id> — force pre/post lift comparison now',
               '',
               'Daily rebalance (9am + 6pm PT):',
               '/rebalance — generate a fresh proposal now',
@@ -3379,6 +3399,29 @@ bot.on('message', async (msg) => {
             await bot.sendMessage(chatId, `Rejected recommendation #${id}.`);
             return;
           }
+          if (sub === 'measure') {
+            const id = Number(args.trim().split(/\s+/)[1]);
+            if (!Number.isFinite(id) || id <= 0) {
+              await bot.sendMessage(chatId, 'Usage: /lp measure <recommendation_id>');
+              return;
+            }
+            await bot.sendChatAction(chatId, 'typing');
+            const r = await measureLpLift(id);
+            if ('error' in r) {
+              await bot.sendMessage(chatId, `Measurement failed: ${r.error}`);
+              return;
+            }
+            const lines: string[] = [
+              `Measurement #${id}:`,
+              `  pre lead_rate: ${r.pre.lead_rate_pct != null ? r.pre.lead_rate_pct.toFixed(2) + '%' : 'n/a'} (${r.pre.leads}/${r.pre.clicks})`,
+              `  post lead_rate: ${r.post.lead_rate_pct != null ? r.post.lead_rate_pct.toFixed(2) + '%' : 'n/a'} (${r.post.leads}/${r.post.clicks})`,
+              `  lift on lead_rate: ${r.lift_lead_rate_pct == null ? 'n/a' : (r.lift_lead_rate_pct >= 0 ? '+' : '') + r.lift_lead_rate_pct.toFixed(1) + '%'}`,
+              `  lift on CPL: ${r.lift_cpl_pct == null ? 'n/a' : (r.lift_cpl_pct >= 0 ? '+' : '') + r.lift_cpl_pct.toFixed(1) + '%'}`,
+            ];
+            if (r.confound_warning) lines.push(`  caveat: ${r.confound_warning}`);
+            await sendChunked(chatId, lines.join('\n'));
+            return;
+          }
           // default: status — most recent snapshots + open recs
           const snaps = await loadLatestSnapshots();
           const recs = await listRecommendations('proposed', 10);
@@ -3641,9 +3684,11 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
-  // Daily 8 AM PT — LP intelligence scrape (competitor first-scrolls).
+  // Mondays 8 AM PT — LP intelligence scrape (competitor first-scrolls).
+  // Weekly cadence: landing pages don't change daily; weekly catches the
+  // signal at a fraction of the cost.
   cron.schedule(
-    '0 8 * * *',
+    '0 8 * * 1',
     () => {
       console.log(`[cron] LP scrape firing at ${new Date().toISOString()}`);
       runDailyLpTick()
@@ -3654,9 +3699,23 @@ if (ENABLE_CRON) {
     },
     { timezone: ACCOUNT_TZ },
   );
+  // Daily 7 AM PT — LP lift measurement loop. Closes the feedback loop on
+  // any 'implemented' recommendation past its 14-day soak window.
+  cron.schedule(
+    '0 7 * * *',
+    () => {
+      console.log(`[cron] LP lift measurement firing at ${new Date().toISOString()}`);
+      runLiftMeasurementTick()
+        .then((r) =>
+          console.log(`[lp-lift] considered=${r.considered} measured=${r.measured} errors=${r.errors}`),
+        )
+        .catch((err) => console.error('LP lift measurement failed:', err));
+    },
+    { timezone: ACCOUNT_TZ },
+  );
 
   console.log(
-    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm + lp 8am in tz=${ACCOUNT_TZ}`,
+    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm + lp Mon 8am + lift daily 7am in tz=${ACCOUNT_TZ}`,
   );
 }
 
