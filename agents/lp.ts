@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import axios from 'axios';
 import Anthropic from '@anthropic-ai/sdk';
 import TelegramBot from 'node-telegram-bot-api';
@@ -10,6 +11,9 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-opus-4-7';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SCREENSHOTONE_KEY = process.env.SCREENSHOTONE_ACCESS_KEY ?? null;
+// Optional. If set, screenshot requests are HMAC-signed so the access_key
+// alone is useless to anyone who intercepts/leaks it.
+const SCREENSHOTONE_SECRET = process.env.SCREENSHOTONE_SECRET_KEY ?? null;
 
 if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY required');
 if (!TELEGRAM_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN required');
@@ -128,33 +132,47 @@ interface CaptureResult {
 
 export const SCREENSHOT_AVAILABLE = SCREENSHOTONE_KEY != null;
 
+function buildScreenshotUrl(targetUrl: string): string {
+  // Stable query-string ordering. ScreenshotOne signs the EXACT query string
+  // it receives, so we build it manually rather than letting axios reorder.
+  const qs = new URLSearchParams();
+  qs.append('url', targetUrl);
+  qs.append('access_key', SCREENSHOTONE_KEY!);
+  qs.append('format', 'png');
+  qs.append('viewport_width', '390');
+  qs.append('viewport_height', '844');
+  qs.append('device_scale_factor', '2');
+  qs.append('full_page', 'false');
+  qs.append('block_ads', 'true');
+  qs.append('block_cookie_banners', 'true');
+  qs.append('block_chats', 'true');
+  qs.append('cache', 'false');
+  qs.append('delay', '2');
+  qs.append('image_quality', '80');
+  let qsString = qs.toString();
+  if (SCREENSHOTONE_SECRET) {
+    const sig = crypto.createHmac('sha256', SCREENSHOTONE_SECRET).update(qsString).digest('hex');
+    qsString += `&signature=${sig}`;
+  }
+  return `https://api.screenshotone.com/take?${qsString}`;
+}
+
 async function captureScreenshot(url: string): Promise<{ base64: string | null; size: number; error: string | null }> {
   if (!SCREENSHOTONE_KEY) {
     return { base64: null, size: 0, error: 'SCREENSHOTONE_ACCESS_KEY not set — skipping screenshot' };
   }
   try {
-    const res = await axios.get('https://api.screenshotone.com/take', {
-      params: {
-        url,
-        access_key: SCREENSHOTONE_KEY,
-        format: 'png',
-        viewport_width: 390,
-        viewport_height: 844,
-        device_scale_factor: 2,
-        full_page: false,
-        block_ads: true,
-        block_cookie_banners: true,
-        block_chats: true,
-        cache: false,
-        delay: 2,
-        image_quality: 80,
-      },
+    const res = await axios.get(buildScreenshotUrl(url), {
       responseType: 'arraybuffer',
-      timeout: 30000,
+      timeout: 45000,
       validateStatus: () => true,
     });
     if (res.status >= 400) {
-      return { base64: null, size: 0, error: `screenshotone http ${res.status}: ${Buffer.from(res.data).toString('utf-8').slice(0, 200)}` };
+      return {
+        base64: null,
+        size: 0,
+        error: `screenshotone http ${res.status}: ${Buffer.from(res.data).toString('utf-8').slice(0, 200)}`,
+      };
     }
     const buf = Buffer.from(res.data);
     return { base64: buf.toString('base64'), size: buf.byteLength, error: null };
