@@ -124,6 +124,7 @@ import {
   cioShowRate,
   cioSendEvent,
   cioDiscoverEventNames,
+  cioHealthCheck,
   CIO_CONFIGURED,
 } from './customerio.js';
 
@@ -2453,6 +2454,89 @@ async function handleCapiCmd(
   await bot.sendMessage(chatId, `Unknown /capi subcommand "${sub}". Run /capi for help.`);
 }
 
+// ---------- /cio status — Customer.io health check ----------
+
+async function handleCioCmd(chatId: number, args: string): Promise<void> {
+  const sub = (args.trim().split(/\s+/)[0] ?? '').toLowerCase();
+
+  if (sub === 'help') {
+    await bot.sendMessage(
+      chatId,
+      [
+        '/cio — show CIO health (default = status)',
+        '/cio status — same as above',
+        '',
+        'Reports: API reachable, events in 24h/7d/30d, last event seen,',
+        'distinct event names. Use this the moment Claya restores their',
+        'pixel + form integration to verify events are flowing before',
+        'waiting for the next CAPI tick.',
+      ].join('\n'),
+    );
+    return;
+  }
+
+  await bot.sendChatAction(chatId, 'typing');
+  let report;
+  try {
+    report = await cioHealthCheck();
+  } catch (err) {
+    await bot.sendMessage(
+      chatId,
+      `CIO health check threw: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+
+  const lines: string[] = [];
+  lines.push('Customer.io health:');
+  lines.push(`  configured:        ${report.configured ? 'yes' : 'no (CIO_APP_API_KEY missing)'}`);
+  lines.push(`  region:            ${report.region}`);
+  lines.push(`  app api reachable: ${report.app_api_reachable ? 'yes' : 'no'}`);
+  lines.push(`  track api ready:   ${report.track_api_configured ? 'yes' : 'no (write events disabled)'}`);
+  lines.push('');
+  lines.push(`Funnel state:        ${formatFunnelState(report.funnel_state)}`);
+  lines.push(`  events last 24h:   ${report.total_events_24h}`);
+  lines.push(`  events last 7d:    ${report.total_events_7d}`);
+  lines.push(`  events last 30d:   ${report.total_events_30d}`);
+  lines.push(
+    `  last event:        ${report.last_event_iso ? `${report.last_event_iso.replace('T', ' ').slice(0, 16)} (${report.last_event_name ?? 'unnamed'})` : 'none'}`,
+  );
+  lines.push('');
+  if (report.distinct_event_names_30d.length === 0) {
+    lines.push('Event types seen (30d): none');
+  } else {
+    lines.push(`Event types seen (30d, top ${Math.min(15, report.distinct_event_names_30d.length)}):`);
+    for (const e of report.distinct_event_names_30d.slice(0, 15)) {
+      const last = e.last_seen_iso ? e.last_seen_iso.replace('T', ' ').slice(0, 16) : '?';
+      lines.push(`  ${e.event_name.padEnd(28)} ${String(e.count).padStart(5)}  last: ${last}`);
+    }
+  }
+  if (report.error_message) {
+    lines.push('');
+    lines.push(`Error: ${report.error_message.slice(0, 300)}`);
+  }
+  if (report.funnel_state === 'silent') {
+    lines.push('');
+    lines.push('Funnel is dark — CIO is reachable but no events in 30d.');
+    lines.push('Likely: pixel not firing on join.claya.com OR form not posting to CIO.');
+    lines.push('Verify with the Claya dev team.');
+  }
+  await sendChunked(chatId, lines.join('\n'));
+}
+
+function formatFunnelState(s: 'live' | 'silent' | 'unconfigured' | 'unknown'): string {
+  switch (s) {
+    case 'live':
+      return 'LIVE — events flowing';
+    case 'silent':
+      return 'SILENT — CIO reachable but zero events 30d';
+    case 'unconfigured':
+      return 'UNCONFIGURED — credentials missing';
+    case 'unknown':
+      return 'UNKNOWN — could not verify';
+  }
+}
+
 // ---------- Permission slash command handlers ----------
 
 async function handlePermsCmd(chatId: number): Promise<void> {
@@ -3086,6 +3170,9 @@ bot.on('message', async (msg) => {
               '/capi enable | /capi disable',
               '/capi backfill <hours>',
               '',
+              'CIO upstream health:',
+              '/cio — health check (events 24h/7d/30d, last seen, funnel state)',
+              '',
               'Or ask anything in plain English. The agent has web search, can drill into ads, save observations, set goals, and create rules.',
             ].join('\n'),
           );
@@ -3271,6 +3358,9 @@ bot.on('message', async (msg) => {
         }
         case 'capi':
           await handleCapiCmd(chatId, userKey, { userId: senderId, username: senderUsername }, args);
+          return;
+        case 'cio':
+          await handleCioCmd(chatId, args);
           return;
         case 'competitors':
         case 'comp': {

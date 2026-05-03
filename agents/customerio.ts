@@ -347,3 +347,116 @@ export async function cioSendEvent(args: {
 }
 
 export const CIO_CONFIGURED = Boolean(APP_API_KEY);
+
+// ---------- Health check ----------
+
+export interface CioHealthReport {
+  configured: boolean;
+  app_api_reachable: boolean;
+  track_api_configured: boolean;
+  region: string;
+  total_events_24h: number;
+  total_events_7d: number;
+  total_events_30d: number;
+  last_event_iso: string | null;
+  last_event_name: string | null;
+  distinct_event_names_30d: DiscoveredEvent[];
+  error_message: string | null;
+  funnel_state: 'live' | 'silent' | 'unconfigured' | 'unknown';
+}
+
+/**
+ * One-shot health check for the Customer.io connection. Used by `/cio status`
+ * to answer "is CIO connected and producing events?" in a single call —
+ * critical for verifying the moment the upstream form/pixel integration
+ * is restored.
+ */
+export async function cioHealthCheck(): Promise<CioHealthReport> {
+  const report: CioHealthReport = {
+    configured: CIO_CONFIGURED,
+    app_api_reachable: false,
+    track_api_configured: Boolean(SITE_ID && TRACK_API_KEY),
+    region: REGION,
+    total_events_24h: 0,
+    total_events_7d: 0,
+    total_events_30d: 0,
+    last_event_iso: null,
+    last_event_name: null,
+    distinct_event_names_30d: [],
+    error_message: null,
+    funnel_state: 'unknown',
+  };
+
+  if (!CIO_CONFIGURED) {
+    report.funnel_state = 'unconfigured';
+    report.error_message = 'CIO_APP_API_KEY not set';
+    return report;
+  }
+
+  try {
+    // One probe call to confirm credentials work. Newest-first stream.
+    const recent = await cioListActivities({ type: 'event', limit: 1 });
+    report.app_api_reachable = true;
+    if (recent.length > 0 && recent[0]?.timestamp) {
+      report.last_event_iso = new Date(recent[0].timestamp * 1000).toISOString();
+      report.last_event_name = recent[0].name ?? null;
+    }
+  } catch (err) {
+    report.error_message = err instanceof Error ? err.message : String(err);
+    return report;
+  }
+
+  // Roll up event names + counts across the last 30 days.
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const discovered = await cioDiscoverEventNames(30, 5000);
+    report.distinct_event_names_30d = discovered;
+    report.total_events_30d = discovered.reduce((s, e) => s + e.count, 0);
+  } catch (err) {
+    report.error_message = err instanceof Error ? err.message : String(err);
+  }
+
+  // Tighter windows — paginate the global stream once and bucket client-side
+  // so we don't hammer the API with three separate scans.
+  try {
+    let count24 = 0;
+    let count7 = 0;
+    const cutoff7 = now - 7 * 86400;
+    const cutoff24 = now - 86400;
+    let next: string | undefined;
+    let safety = 0;
+    let stop = false;
+    while (!stop && safety < 20) {
+      const params: Record<string, string> = { type: 'event', limit: '1000' };
+      if (next) params.start_id = next;
+      const { data } = await appClient.get('/activities', { headers: appHeaders(), params });
+      const acts = (data?.activities ?? []) as CioActivity[];
+      if (acts.length === 0) break;
+      for (const a of acts) {
+        const ts = a.timestamp ?? 0;
+        if (ts < cutoff7) {
+          stop = true;
+          break;
+        }
+        if (ts >= cutoff24) count24++;
+        if (ts >= cutoff7) count7++;
+      }
+      next = data?.next;
+      if (!next) break;
+      safety++;
+    }
+    report.total_events_24h = count24;
+    report.total_events_7d = count7;
+  } catch (err) {
+    if (!report.error_message) {
+      report.error_message = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // Classify funnel state.
+  if (report.total_events_30d > 0) report.funnel_state = 'live';
+  else if (report.app_api_reachable) report.funnel_state = 'silent';
+  else report.funnel_state = 'unknown';
+
+  return report;
+}
