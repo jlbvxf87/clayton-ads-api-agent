@@ -3825,35 +3825,42 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
-  // Daily 8:30 AM PT — CAPI bridge digest. Broadcasts last-24h forward
-  // totals, error rate, sample customer emails (separating internal/test
-  // addresses) so silent regressions surface without anyone querying.
-  cron.schedule(
-    '30 8 * * *',
-    async () => {
-      console.log(`[cron] capi digest firing at ${new Date().toISOString()}`);
-      try {
-        const digest = await getCapiDigest(24);
-        const text = formatCapiDigest(digest);
-        for (const id of ALLOWED_USER_IDS) {
-          try {
-            await bot.sendMessage(id, text);
-          } catch (err) {
-            console.error(`[capi-digest] send to ${id} failed:`, err);
-          }
+  // CAPI bridge digest — broadcasts last-24h forward totals, error rate,
+  // and sample customer emails (separating internal/test addresses) so
+  // silent regressions surface without anyone querying. Default target
+  // is the Clayton Meta Ads group (-5086989989) since Josh hasn't DM'd
+  // the bot. Override with TELEGRAM_DIGEST_CHAT_ID env var; set to "users"
+  // to fall back to broadcasting individual ALLOWED_USER_IDS.
+  const DIGEST_CHAT_ID = (process.env.TELEGRAM_DIGEST_CHAT_ID ?? '-5086989989').trim();
+
+  async function fireCapiDigest(label: string): Promise<void> {
+    console.log(`[cron] capi digest (${label}) firing at ${new Date().toISOString()}`);
+    try {
+      const digest = await getCapiDigest(24);
+      const text = `[${label}]\n${formatCapiDigest(digest)}`;
+      const targets = DIGEST_CHAT_ID === 'users' ? [...ALLOWED_USER_IDS] : [DIGEST_CHAT_ID];
+      for (const t of targets) {
+        try {
+          await bot.sendMessage(t, text);
+        } catch (err) {
+          console.error(`[capi-digest] send to ${t} failed:`, err);
         }
-        console.log(
-          `[capi-digest] total=${digest.total} ok=${digest.success} err=${digest.errors} internal=${digest.internal_emails.length}`,
-        );
-      } catch (err) {
-        console.error('capi digest failed:', err);
       }
-    },
-    { timezone: ACCOUNT_TZ },
-  );
+      console.log(
+        `[capi-digest:${label}] total=${digest.total} ok=${digest.success} err=${digest.errors} internal=${digest.internal_emails.length}`,
+      );
+    } catch (err) {
+      console.error(`capi digest (${label}) failed:`, err);
+    }
+  }
+
+  // Three pings/day so changes are visible morning, mid-day, and end-of-day.
+  cron.schedule('30 8 * * *', () => fireCapiDigest('morning 8:30 AM PT'), { timezone: ACCOUNT_TZ });
+  cron.schedule('0 13 * * *', () => fireCapiDigest('midday 1:00 PM PT'), { timezone: ACCOUNT_TZ });
+  cron.schedule('0 21 * * *', () => fireCapiDigest('evening 9:00 PM PT'), { timezone: ACCOUNT_TZ });
 
   console.log(
-    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm + lp Mon 8am + lift daily 7am + capi digest 8:30am in tz=${ACCOUNT_TZ}`,
+    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm + lp Mon 8am + lift daily 7am + capi digest 8:30am,1pm,9pm → ${DIGEST_CHAT_ID} in tz=${ACCOUNT_TZ}`,
   );
 }
 
