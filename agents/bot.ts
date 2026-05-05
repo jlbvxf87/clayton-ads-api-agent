@@ -79,6 +79,8 @@ import {
   runCapiTick,
   runCapiBackfill,
   listRecentForwards,
+  getCapiDigest,
+  formatCapiDigest,
 } from './capi.js';
 import {
   runJudgmentOnSignal,
@@ -2323,7 +2325,20 @@ async function handleCapiCmd(
     lines.push('  /capi backfill <hours>');
     lines.push('  /capi tick — force one poll now');
     lines.push('  /capi forwards [limit] — list recent forwards');
+    lines.push('  /capi digest [hours=24] — summarize last N hours');
     await sendChunked(chatId, lines.join('\n'));
+    return;
+  }
+
+  if (sub === 'digest') {
+    const hoursArg = parseInt(parts[1] ?? '24', 10);
+    const hours = Number.isFinite(hoursArg) && hoursArg > 0 ? Math.min(hoursArg, 168) : 24;
+    try {
+      const d = await getCapiDigest(hours);
+      await bot.sendMessage(chatId, formatCapiDigest(d));
+    } catch (err) {
+      await bot.sendMessage(chatId, `digest failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return;
   }
 
@@ -3810,8 +3825,35 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
+  // Daily 8:30 AM PT — CAPI bridge digest. Broadcasts last-24h forward
+  // totals, error rate, sample customer emails (separating internal/test
+  // addresses) so silent regressions surface without anyone querying.
+  cron.schedule(
+    '30 8 * * *',
+    async () => {
+      console.log(`[cron] capi digest firing at ${new Date().toISOString()}`);
+      try {
+        const digest = await getCapiDigest(24);
+        const text = formatCapiDigest(digest);
+        for (const id of ALLOWED_USER_IDS) {
+          try {
+            await bot.sendMessage(id, text);
+          } catch (err) {
+            console.error(`[capi-digest] send to ${id} failed:`, err);
+          }
+        }
+        console.log(
+          `[capi-digest] total=${digest.total} ok=${digest.success} err=${digest.errors} internal=${digest.internal_emails.length}`,
+        );
+      } catch (err) {
+        console.error('capi digest failed:', err);
+      }
+    },
+    { timezone: ACCOUNT_TZ },
+  );
+
   console.log(
-    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm + lp Mon 8am + lift daily 7am in tz=${ACCOUNT_TZ}`,
+    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm + lp Mon 8am + lift daily 7am + capi digest 8:30am in tz=${ACCOUNT_TZ}`,
   );
 }
 

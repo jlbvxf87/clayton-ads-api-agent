@@ -550,6 +550,100 @@ export async function runCapiBackfill(hours: number): Promise<CapiTickResult> {
   return runCapiTick({ lookbackMinutes: hours * 60 });
 }
 
+// ---------- Digest (daily summary) ----------
+
+export interface CapiDigest {
+  window_hours: number;
+  total: number;
+  success: number;
+  errors: number;
+  by_event: Record<string, number>;
+  sample_emails: string[];
+  internal_emails: string[];
+  top_error: string | null;
+}
+
+// Heuristics for "internal/test" emails. Stays loose on purpose — false
+// positives in the digest are cheap (just labels), false negatives let
+// test traffic pollute Meta's optimizer silently.
+function looksInternal(email: string): boolean {
+  const e = email.toLowerCase();
+  if (e.endsWith('@claya.com')) return true;
+  if (e.endsWith('@seelr.com')) return true;
+  if (e.includes('+test') || e.includes('+qa') || e.includes('+demo')) return true;
+  return false;
+}
+
+export async function getCapiDigest(hours = 24): Promise<CapiDigest> {
+  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('capi_forwards')
+    .select('meta_event_name, customer_email, success, error_message')
+    .gte('created_at', since);
+  if (error) throw new Error(`getCapiDigest: ${error.message}`);
+  const rows = (data ?? []) as Array<{
+    meta_event_name: string;
+    customer_email: string | null;
+    success: boolean;
+    error_message: string | null;
+  }>;
+  const digest: CapiDigest = {
+    window_hours: hours,
+    total: rows.length,
+    success: 0,
+    errors: 0,
+    by_event: {},
+    sample_emails: [],
+    internal_emails: [],
+    top_error: null,
+  };
+  for (const r of rows) {
+    if (r.success) digest.success++;
+    else digest.errors++;
+    digest.by_event[r.meta_event_name] = (digest.by_event[r.meta_event_name] ?? 0) + 1;
+    if (r.customer_email) {
+      if (looksInternal(r.customer_email)) {
+        if (digest.internal_emails.length < 5) digest.internal_emails.push(r.customer_email);
+      } else if (digest.sample_emails.length < 5) {
+        digest.sample_emails.push(r.customer_email);
+      }
+    }
+    if (!r.success && !digest.top_error && r.error_message) {
+      digest.top_error = r.error_message.slice(0, 200);
+    }
+  }
+  return digest;
+}
+
+export function formatCapiDigest(d: CapiDigest): string {
+  const lines: string[] = [];
+  lines.push(`CAPI bridge — last ${d.window_hours}h`);
+  lines.push('');
+  if (d.total === 0) {
+    lines.push('No forwards in the window.');
+    lines.push('Check: bot up? CIO Quiz_Started flips happening? capi_event_map enabled?');
+    return lines.join('\n');
+  }
+  lines.push(`Forwarded: ${d.total}  (ok=${d.success}  err=${d.errors})`);
+  const eventLines = Object.entries(d.by_event).map(([k, v]) => `  ${k}: ${v}`);
+  if (eventLines.length > 0) lines.push(...eventLines);
+  if (d.errors > 0 && d.top_error) {
+    lines.push('');
+    lines.push(`Top error: ${d.top_error}`);
+  }
+  if (d.internal_emails.length > 0) {
+    lines.push('');
+    lines.push(`Possible test/internal (${d.internal_emails.length}):`);
+    for (const e of d.internal_emails.slice(0, 3)) lines.push(`  ${e}`);
+  }
+  if (d.sample_emails.length > 0) {
+    lines.push('');
+    lines.push(`Sample real leads:`);
+    for (const e of d.sample_emails.slice(0, 3)) lines.push(`  ${e}`);
+  }
+  return lines.join('\n');
+}
+
 // ---------- Forwards readout ----------
 
 export async function listRecentForwards(limit = 50): Promise<CapiForward[]> {
