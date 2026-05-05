@@ -193,8 +193,38 @@ export async function postToMetaCapi(args: {
 
 // ---------- Activity → CAPI event ----------
 
+// Prefix convention: `attr:<AttributeName>` in capi_event_map.cio_event_name
+// routes that row through the attribute-change forwarder instead of the
+// named-event forwarder. Lets us synthesize CAPI events from CIO profile
+// attribute flips when the upstream form writes attributes but doesn't
+// emit named events (Claya's join.claya.com quiz today).
+const ATTR_PREFIX = 'attr:';
+
 function buildEventId(activityId: string): string {
   return `cio:${activityId}`;
+}
+
+function buildAttrEventId(activityId: string): string {
+  return `cio:attr:${activityId}`;
+}
+
+function attributeFlippedTo(act: CioActivity, attr: string, target: string): boolean {
+  if (act.type !== 'attribute_change') return false;
+  const d = act.data as Record<string, unknown> | undefined;
+  if (!d) return false;
+  const change = d[attr] as { from?: unknown; to?: unknown } | undefined;
+  if (!change || typeof change !== 'object') return false;
+  if (String(change.to) !== target) return false;
+  // Skip no-op writes that re-set the same value.
+  if (String(change.from ?? '') === target) return false;
+  return true;
+}
+
+function readAttrToString(d: Record<string, unknown> | undefined, key: string): string | null {
+  if (!d) return null;
+  const v = d[key] as { to?: unknown } | undefined;
+  if (!v || typeof v !== 'object') return null;
+  return typeof v.to === 'string' && v.to ? (v.to as string) : null;
 }
 
 async function fetchCustomerForActivity(act: CioActivity): Promise<{
@@ -236,13 +266,15 @@ async function fetchCustomerForActivity(act: CioActivity): Promise<{
   return { email, phone, first_name: first, last_name: last, external_id: cid };
 }
 
-export async function forwardActivity(
-  act: CioActivity,
-  map: CapiEventMap,
-  cfg: CapiConfig,
-): Promise<{ ok: boolean; meta_event_id: string; http_status: number; body: unknown; error?: string }> {
-  if (!cfg.pixel_id) throw new Error('capi_config.pixel_id is not set');
-  const cust = await fetchCustomerForActivity(act);
+interface CustomerFields {
+  email: string | null;
+  phone: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  external_id: string | null;
+}
+
+function buildUserData(cust: CustomerFields): CapiUserData {
   const userData: CapiUserData = {};
   const em = hashEmail(cust.email);
   if (em) userData.em = [em];
@@ -253,12 +285,79 @@ export async function forwardActivity(
   const ln = hashName(cust.last_name);
   if (ln) userData.ln = [ln];
   if (cust.external_id) userData.external_id = [sha256Hex(cust.external_id)];
+  return userData;
+}
 
-  const meta_event_id = buildEventId(act.id);
-  const event_time = Math.max(
-    Math.floor(Date.now() / 1000) - 7 * 86400 + 60, // floor at 7d-old + 1min so Meta doesn't reject
-    act.timestamp ?? Math.floor(Date.now() / 1000),
+async function postAndLog(args: {
+  act: CioActivity;
+  map: CapiEventMap;
+  cfg: CapiConfig;
+  cust: CustomerFields;
+  meta_event_id: string;
+  event: CapiEventPayload;
+}): Promise<{ ok: boolean; meta_event_id: string; http_status: number; body: unknown; error?: string }> {
+  const { act, map, cfg, cust, meta_event_id, event } = args;
+  let res: { http_status: number; body: unknown };
+  try {
+    res = await postToMetaCapi({
+      pixel_id: cfg.pixel_id!,
+      events: [event],
+      test_event_code: cfg.test_event_code,
+    });
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    await logForward({
+      cio_activity_id: act.id,
+      cio_event_name: map.cio_event_name,
+      meta_event_name: map.meta_event_name,
+      pixel_id: cfg.pixel_id!,
+      meta_event_id,
+      customer_id: cust.external_id,
+      customer_email: cust.email,
+      event_time: event.event_time,
+      success: false,
+      http_status: null,
+      meta_response: null,
+      error_message: m,
+    });
+    return { ok: false, meta_event_id, http_status: 0, body: null, error: m };
+  }
+  const ok = res.http_status >= 200 && res.http_status < 300;
+  await logForward({
+    cio_activity_id: act.id,
+    cio_event_name: map.cio_event_name,
+    meta_event_name: map.meta_event_name,
+    pixel_id: cfg.pixel_id!,
+    meta_event_id,
+    customer_id: cust.external_id,
+    customer_email: cust.email,
+    event_time: event.event_time,
+    success: ok,
+    http_status: res.http_status,
+    meta_response: res.body,
+    error_message: ok ? null : JSON.stringify(res.body).slice(0, 500),
+  });
+  return { ok, meta_event_id, http_status: res.http_status, body: res.body };
+}
+
+function eventTimeFloored(actTimestamp: number | undefined): number {
+  // Meta CAPI rejects events older than 7 days; floor at 7d-1min ago.
+  return Math.max(
+    Math.floor(Date.now() / 1000) - 7 * 86400 + 60,
+    actTimestamp ?? Math.floor(Date.now() / 1000),
   );
+}
+
+export async function forwardActivity(
+  act: CioActivity,
+  map: CapiEventMap,
+  cfg: CapiConfig,
+): Promise<{ ok: boolean; meta_event_id: string; http_status: number; body: unknown; error?: string }> {
+  if (!cfg.pixel_id) throw new Error('capi_config.pixel_id is not set');
+  const cust = await fetchCustomerForActivity(act);
+  const userData = buildUserData(cust);
+  const meta_event_id = buildEventId(act.id);
+  const event_time = eventTimeFloored(act.timestamp);
 
   const event: CapiEventPayload = {
     event_name: map.meta_event_name,
@@ -276,48 +375,57 @@ export async function forwardActivity(
     if (Object.keys(cd).length > 0) event.custom_data = cd;
   }
 
-  let res: { http_status: number; body: unknown };
-  try {
-    res = await postToMetaCapi({
-      pixel_id: cfg.pixel_id,
-      events: [event],
-      test_event_code: cfg.test_event_code,
-    });
-  } catch (err) {
-    const m = err instanceof Error ? err.message : String(err);
-    await logForward({
-      cio_activity_id: act.id,
-      cio_event_name: map.cio_event_name,
-      meta_event_name: map.meta_event_name,
-      pixel_id: cfg.pixel_id,
-      meta_event_id,
-      customer_id: cust.external_id,
-      customer_email: cust.email,
-      event_time,
-      success: false,
-      http_status: null,
-      meta_response: null,
-      error_message: m,
-    });
-    return { ok: false, meta_event_id, http_status: 0, body: null, error: m };
+  return postAndLog({ act, map, cfg, cust, meta_event_id, event });
+}
+
+// Forward a CIO attribute_change activity as a synthetic CAPI event.
+// Reads PII from the activity's attribute deltas first (cheaper, avoids
+// race conditions on profile fetch); falls back to /customers/:id/attributes
+// if the deltas don't include enough identifiers.
+export async function forwardAttributeChange(
+  act: CioActivity,
+  map: CapiEventMap,
+  cfg: CapiConfig,
+): Promise<{ ok: boolean; meta_event_id: string; http_status: number; body: unknown; error?: string }> {
+  if (!cfg.pixel_id) throw new Error('capi_config.pixel_id is not set');
+  const d = (act.data as Record<string, unknown> | undefined) ?? undefined;
+  let cust: CustomerFields = {
+    email: readAttrToString(d, 'email'),
+    phone: readAttrToString(d, 'phone') ?? readAttrToString(d, 'phone_number'),
+    first_name: readAttrToString(d, 'first_name') ?? readAttrToString(d, 'firstname'),
+    last_name: readAttrToString(d, 'last_name') ?? readAttrToString(d, 'lastname'),
+    external_id: act.customer_id ?? act.cio_id ?? null,
+  };
+  if (!cust.email && cust.external_id) {
+    const fetched = await cioGetCustomer(cust.external_id);
+    if (fetched) {
+      const attrs = (fetched.attributes ?? {}) as Record<string, unknown>;
+      const pickStr = (k: string): string | null =>
+        typeof attrs[k] === 'string' && (attrs[k] as string).length > 0 ? (attrs[k] as string) : null;
+      cust = {
+        email: cust.email ?? (typeof fetched.email === 'string' ? fetched.email : pickStr('email')),
+        phone: cust.phone ?? pickStr('phone') ?? pickStr('phone_number'),
+        first_name: cust.first_name ?? pickStr('first_name') ?? pickStr('firstname'),
+        last_name: cust.last_name ?? pickStr('last_name') ?? pickStr('lastname'),
+        external_id: cust.external_id,
+      };
+    }
   }
 
-  const ok = res.http_status >= 200 && res.http_status < 300;
-  await logForward({
-    cio_activity_id: act.id,
-    cio_event_name: map.cio_event_name,
-    meta_event_name: map.meta_event_name,
-    pixel_id: cfg.pixel_id,
-    meta_event_id,
-    customer_id: cust.external_id,
-    customer_email: cust.email,
+  const userData = buildUserData(cust);
+  const meta_event_id = buildAttrEventId(act.id);
+  const event_time = eventTimeFloored(act.timestamp);
+
+  const event: CapiEventPayload = {
+    event_name: map.meta_event_name,
     event_time,
-    success: ok,
-    http_status: res.http_status,
-    meta_response: res.body,
-    error_message: ok ? null : JSON.stringify(res.body).slice(0, 500),
-  });
-  return { ok, meta_event_id, http_status: res.http_status, body: res.body };
+    event_id: meta_event_id,
+    action_source: map.action_source ?? cfg.default_action_source,
+    user_data: userData,
+  };
+  if (cfg.default_event_source_url) event.event_source_url = cfg.default_event_source_url;
+
+  return postAndLog({ act, map, cfg, cust, meta_event_id, event });
 }
 
 async function logForward(row: Omit<CapiForward, 'id' | 'created_at'>): Promise<void> {
@@ -368,33 +476,73 @@ export async function runCapiTick(opts: { lookbackMinutes?: number } = {}): Prom
 
   const maps = (await listEventMap()).filter((m) => m.enabled);
   if (maps.length === 0) return result;
-  const mapByName = new Map(maps.map((m) => [m.cio_event_name, m] as const));
 
-  // Pull recent activities — global stream, paginate newest-first, stop after lookback.
   const startUnix = Math.floor(Date.now() / 1000) - lookback * 60;
-  const acts = await cioListActivities({ type: 'event', limit: 200, start: startUnix });
-  result.scanned = acts.length;
 
-  for (const a of acts) {
-    if (!a.name) continue;
-    const map = mapByName.get(a.name);
-    if (!map) continue;
-    result.matched++;
-
-    const meta_event_id = buildEventId(a.id);
-    if (await alreadyForwarded(a.id, meta_event_id)) {
-      result.skipped_dedup++;
-      continue;
-    }
-    try {
-      const r = await forwardActivity(a, map, cfg);
-      if (r.ok) result.forwarded++;
-      else result.errors++;
-    } catch (err) {
-      console.error('[CAPI] forwardActivity threw:', err);
-      result.errors++;
+  // ---- Path 1: named CIO events → CAPI (original) ----
+  const eventMaps = maps.filter((m) => !m.cio_event_name.startsWith(ATTR_PREFIX));
+  if (eventMaps.length > 0) {
+    const mapByName = new Map(eventMaps.map((m) => [m.cio_event_name, m] as const));
+    const acts = await cioListActivities({ type: 'event', limit: 200, start: startUnix });
+    result.scanned += acts.length;
+    for (const a of acts) {
+      if (!a.name) continue;
+      const map = mapByName.get(a.name);
+      if (!map) continue;
+      result.matched++;
+      const meta_event_id = buildEventId(a.id);
+      if (await alreadyForwarded(a.id, meta_event_id)) {
+        result.skipped_dedup++;
+        continue;
+      }
+      try {
+        const r = await forwardActivity(a, map, cfg);
+        if (r.ok) result.forwarded++;
+        else result.errors++;
+      } catch (err) {
+        console.error('[CAPI] forwardActivity threw:', err);
+        result.errors++;
+      }
     }
   }
+
+  // ---- Path 2: CIO attribute_change deltas → synthetic CAPI events ----
+  // For each map row whose cio_event_name starts with `attr:`, the suffix
+  // names the attribute we watch for. The synthetic Lead fires when that
+  // attribute flips from any non-target value to "true" (Quiz_Started=true
+  // is Claya's quiz-submit signal today, since the form doesn't fire a
+  // named CIO event).
+  const attrMaps = maps.filter((m) => m.cio_event_name.startsWith(ATTR_PREFIX));
+  if (attrMaps.length > 0) {
+    const acts = await cioListActivities({
+      type: 'attribute_change',
+      limit: 200,
+      start: startUnix,
+    });
+    result.scanned += acts.length;
+    for (const a of acts) {
+      for (const map of attrMaps) {
+        const attrName = map.cio_event_name.slice(ATTR_PREFIX.length);
+        if (!attributeFlippedTo(a, attrName, 'true')) continue;
+        result.matched++;
+        const meta_event_id = buildAttrEventId(a.id);
+        if (await alreadyForwarded(a.id, meta_event_id)) {
+          result.skipped_dedup++;
+          break;
+        }
+        try {
+          const r = await forwardAttributeChange(a, map, cfg);
+          if (r.ok) result.forwarded++;
+          else result.errors++;
+        } catch (err) {
+          console.error('[CAPI] forwardAttributeChange threw:', err);
+          result.errors++;
+        }
+        break; // one synthetic event per activity, even if multiple maps would match
+      }
+    }
+  }
+
   return result;
 }
 
