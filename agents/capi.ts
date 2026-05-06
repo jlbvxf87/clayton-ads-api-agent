@@ -413,7 +413,14 @@ export async function forwardAttributeChange(
   }
 
   const userData = buildUserData(cust);
-  const meta_event_id = buildAttrEventId(act.id);
+  // For Lead events, key the event_id on sha256(email) so the browser-side
+  // fbq('track','Lead', {}, {eventID: sha256(email)}) in claya-nextjs
+  // dedupes against this server fire automatically. Falls back to the
+  // attribute-activity id when there's no email or the event is not Lead.
+  const meta_event_id =
+    map.meta_event_name === 'Lead' && cust.email
+      ? sha256Hex(cust.email.trim().toLowerCase())
+      : buildAttrEventId(act.id);
   const event_time = eventTimeFloored(act.timestamp);
 
   const event: CapiEventPayload = {
