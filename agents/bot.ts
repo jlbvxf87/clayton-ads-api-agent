@@ -857,6 +857,28 @@ function isBareCancel(text: string): boolean {
   return BARE_CANCEL_STRINGS.has(text.trim().toLowerCase());
 }
 
+/**
+ * Two-bot routing in the shared Meta-Ads group: returns true when a
+ * message is addressed to Google Clayton (@Clayton_googlebot) and this
+ * bot (Clayton-Meta) should stay silent. Matches:
+ *  - Slash command directed at Google Clayton: "/help@Clayton_googlebot ..."
+ *  - @-mention as first token:                  "@Clayton_googlebot ..."
+ *  - "google" or "google clayton" as the first word: "google, status today"
+ *
+ * Anything else routes to Clayton-Meta by default.
+ */
+export function isAddressedToGoogleClayton(text: string): boolean {
+  const t = text.toLowerCase().trim();
+  if (!t) return false;
+  // Slash command targeting the Google Clayton bot's @-handle.
+  if (/^\/[a-z_]+@clayton_googlebot\b/.test(t)) return true;
+  // @-mention as the first token.
+  if (/^@clayton_googlebot\b/.test(t)) return true;
+  // Natural language: starts with "google" (optionally followed by "clayton").
+  if (/^google(\s+clayton)?\b/.test(t)) return true;
+  return false;
+}
+
 function classifyReply(text: string): 'confirm' | 'cancel' | 'unclear' {
   const t = text.trim();
   if (CANCEL_REGEX.test(t)) return 'cancel';
@@ -3259,6 +3281,19 @@ bot.on('message', async (msg) => {
     console.warn(
       `[unauthorized] from id=${senderId ?? '?'} username=@${msg.from?.username ?? '<none>'} text=${text.slice(0, 80)}`,
     );
+    return;
+  }
+
+  // ---------- Two-bot routing in shared groups ----------
+  // When Clayton (this bot) and Google Clayton (@Clayton_googlebot) are
+  // both in the same group, route messages by addressee. Clayton is the
+  // DEFAULT (responds to anything not explicitly addressed to Google
+  // Clayton). Google Clayton ignores anything that doesn't start with
+  // "google", "google clayton", or its @-handle.
+  //
+  // This bot stays silent when a message is addressed to Google Clayton.
+  const isGroupChat = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  if (isGroupChat && isAddressedToGoogleClayton(text)) {
     return;
   }
 
