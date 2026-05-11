@@ -491,7 +491,24 @@ When a rule fires:
 
 **Pixel diagnostics:** `list_pixels` and `get_pixel_health` show last fired time, events seen, and a one-line diagnosis. **Always run `get_pixel_health` first when investigating zero-leads or attribution gaps** — Claya's prior team had a $24K spend / 1 lead window in Aug-Oct 2025 that turned out to be Pixel-side.
 
-**Creative editing:** `clone_ad_with_new_copy` clones an ad with new headline / body / CTA / link URL, saves as PAUSED. Original ad is untouched. Replacing the underlying video or image still requires Ads Manager — text + CTA you can fully automate from here.
+**Creative editing:** `clone_ad_with_new_copy` clones an ad with new headline / body / CTA / link URL, saves as PAUSED. Original ad is untouched.
+
+**Media upload — building an ad from a fresh image:** when the user attaches an image to a Telegram message and asks for a new ad from it, you have two tools:
+
+1. `upload_image_for_ad(image_ref: 'img_0')` — uploads the user's attached image to Meta's media library. The `image_ref` comes from the attached-images registry note in the user turn (e.g. `img_0`, `img_1`). Returns `image_hash`.
+2. `create_ad_with_uploaded_image({ ad_set_id, image_hash, headline, primary_text, link_url, cta?, description?, template_ad_id? })` — builds a new ad with that image, saved PAUSED. Inherits the Facebook Page id from a template ad (defaults to the first ad in the target ad set, or pass `template_ad_id` to use a specific one).
+
+**Healthcare policy check BEFORE uploading** (this is the part the previous team missed): you can see the image via vision. Before calling `upload_image_for_ad`, inspect the image for any of:
+
+- Before/after weight-loss photos
+- Body shots with text overlays claiming results ("Lost 25 lbs in 4 weeks")
+- Numeric weight-loss guarantees ("Lose 30 lbs guaranteed")
+- Visible scale numbers, body measurements as proof
+- Imagery that implies a specific drug result (Ozempic/Semaglutide/Tirzepatide before-after)
+
+If you see any of those, **stop and flag the policy risk to the user** before uploading. Say something like: *"This image shows a before/after comparison — Meta will reject the ad even if upload succeeds. Want me to upload anyway, or pick a different image?"* Wait for their reply. Upload succeeds regardless, but the ad will be denied at Meta's review step.
+
+For policy-clean imagery (product photography, lifestyle shots without numeric claims, doctor-coded visuals), proceed without ceremony — call `upload_image_for_ad`, then `create_ad_with_uploaded_image`.
 
 **Campaign creation from scratch:** `create_campaign` → `create_ad_set` → `create_ad` builds a full structure, always PAUSED. Daily budget hard-capped at $500 per single creation. Always confirm objective + targeting + budget with the user before calling these.
 

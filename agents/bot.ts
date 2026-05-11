@@ -27,6 +27,8 @@ import {
   getActionBreakdown,
   sumAction,
   cloneAdWithNewCopy,
+  uploadImage,
+  createAdFromImage,
   createCampaign,
   createAdSet,
   createAd,
@@ -166,6 +168,24 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 // ---------- Image attachment handling ----------
+
+// ---------- Per-turn image registry ----------
+// When a user attaches images to a Telegram message, askClaude() puts
+// them here keyed by chatId so tools called within that turn can resolve
+// the bytes by ref (e.g. 'img_0', 'img_1'). The registry is cleared at
+// end of turn so tool calls in later turns can't accidentally re-upload
+// stale images. Single bot, sequential turns per chat, so a Map is safe.
+const turnImages = new Map<number, AttachedImage[]>();
+
+function resolveAttachedImage(chatId: number, ref: string | undefined): AttachedImage | null {
+  if (!ref) return null;
+  const images = turnImages.get(chatId);
+  if (!images || images.length === 0) return null;
+  const m = ref.match(/^img_(\d+)$/);
+  if (!m) return null;
+  const idx = Number(m[1]);
+  return images[idx] ?? null;
+}
 
 interface AttachedImage {
   media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
@@ -1247,6 +1267,51 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'upload_image_for_ad',
+    description:
+      "Upload a user-attached image to Meta's media library so it can be used in a new ad creative. The user must have attached the image to their current Telegram message — pass the registry ref (e.g. 'img_0') from the attached-images note. Returns an image_hash you can then pass to create_ad_with_uploaded_image. POLICY: before calling this for healthcare ads (Claya is GLP-1 / weight loss), inspect the image for before/after weight loss imagery, body shots with weight-loss text overlays, or 'guaranteed results' framing — flag those to the user and confirm before uploading, because Meta will reject the eventual ad even though the upload itself succeeds.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        image_ref: {
+          type: 'string',
+          description: "Registry ref from the attached-images note, e.g. 'img_0'",
+        },
+        filename: {
+          type: 'string',
+          description: 'Optional friendly filename (cosmetic only — Meta dedupes by content hash)',
+        },
+      },
+      required: ['image_ref'],
+    },
+  },
+  {
+    name: 'create_ad_with_uploaded_image',
+    description:
+      "Build a new ad from an uploaded image. Inherits the Facebook Page id from a template ad (defaults to the first existing ad in the target ad set; can be overridden with template_ad_id). Saves the new ad as PAUSED — the user must explicitly resume before it goes live. Use after upload_image_for_ad has returned an image_hash. Headline (40 chars rec) + primary_text + link_url required; description + cta optional.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        ad_set_id: { type: 'string', description: 'Target ad set — new ad lands here as PAUSED' },
+        image_hash: { type: 'string', description: 'From upload_image_for_ad' },
+        headline: { type: 'string', description: 'The ad headline (link_data.name), ≤40 chars recommended' },
+        primary_text: { type: 'string', description: 'The main body text shown above the image (link_data.message)' },
+        description: { type: 'string', description: 'Optional secondary description below the headline' },
+        cta: {
+          type: 'string',
+          description: "CTA button label: 'APPLY_NOW' | 'LEARN_MORE' | 'SIGN_UP' | 'GET_QUOTE' | 'BOOK_TRAVEL' | 'CONTACT_US' | 'DOWNLOAD' | 'GET_OFFER' | 'SHOP_NOW'",
+        },
+        link_url: { type: 'string', description: 'Destination URL the CTA points to' },
+        ad_name: { type: 'string', description: "Optional friendly name; default 'image-upload <date>'" },
+        template_ad_id: {
+          type: 'string',
+          description: 'Optional — borrow page_id from a specific ad instead of the first ad in the target ad set',
+        },
+      },
+      required: ['ad_set_id', 'image_hash', 'headline', 'primary_text', 'link_url'],
+    },
+  },
+  {
     name: 'get_ad_set_targeting',
     description: "Read the targeting JSON for an ad set. Returns geo_locations, age_min/max, interests, custom_audiences, etc.",
     input_schema: {
@@ -1842,6 +1907,55 @@ async function dispatchTool(
         creative_id: input.creative_id as string,
       });
       await logAgentAction(chatId, 'create_ad', result.id, input.name as string, null, { creative_id: input.creative_id });
+      return result;
+    }
+    case 'upload_image_for_ad': {
+      // Look up the user-attached image by registry ref ('img_0', 'img_1', etc.).
+      const img = resolveAttachedImage(chatId, input.image_ref as string | undefined);
+      if (!img) {
+        return {
+          error: `No image found at ref "${input.image_ref}". User must attach the image to the current Telegram message; refs reset every turn.`,
+        };
+      }
+      const result = await uploadImage({
+        bytes: Buffer.from(img.data, 'base64'),
+        mime_type: img.media_type,
+        filename: (input.filename as string | undefined) ?? undefined,
+      });
+      await logAgentAction(chatId, 'upload_image', result.image_hash, null, null, {
+        image_ref: input.image_ref,
+        url: result.url,
+        width: result.width,
+        height: result.height,
+      });
+      return result;
+    }
+    case 'create_ad_with_uploaded_image': {
+      const result = await createAdFromImage({
+        ad_set_id: input.ad_set_id as string,
+        image_hash: input.image_hash as string,
+        headline: input.headline as string,
+        primary_text: input.primary_text as string,
+        description: input.description as string | undefined,
+        cta: input.cta as string | undefined,
+        link_url: input.link_url as string,
+        ad_name: input.ad_name as string | undefined,
+        template_ad_id: input.template_ad_id as string | undefined,
+      });
+      await logAgentAction(
+        chatId,
+        'create_ad_with_uploaded_image',
+        result.new_ad_id,
+        (input.ad_name as string) ?? null,
+        null,
+        {
+          ad_set_id: input.ad_set_id,
+          image_hash: input.image_hash,
+          new_creative_id: result.new_creative_id,
+          template_ad_id: result.template_ad_id,
+          page_id: result.page_id,
+        },
+      );
       return result;
     }
     case 'get_ad_set_targeting': {
@@ -2743,6 +2857,22 @@ const WRITE_TOOL_SPECS: Record<string, WriteToolSpec> = {
     paramsFor: () => ({}),
     targetLabel: (i) => `create ad "${i.name}" in ad set ${i.adset_id}`,
   },
+  // Image upload is a low-risk add (just an asset in the library, doesn't
+  // affect spend) but we still gate it so audit log captures who uploaded
+  // what. Reuses the 'create_ad' permission kind — anyone authorized to
+  // create ads can upload the source media.
+  upload_image_for_ad: {
+    permKind: () => 'create_ad',
+    paramsFor: () => ({}),
+    targetLabel: (i) =>
+      `upload image (ref ${typeof i.image_ref === 'string' ? i.image_ref : '?'}) to Meta media library`,
+  },
+  create_ad_with_uploaded_image: {
+    permKind: () => 'create_ad',
+    paramsFor: () => ({}),
+    targetLabel: (i) =>
+      `create new ad with uploaded image in ad set ${typeof i.ad_set_id === 'string' ? i.ad_set_id : '?'}`,
+  },
   update_ad_set_targeting: {
     permKind: () => 'targeting',
     paramsFor: () => ({}),
@@ -3008,6 +3138,22 @@ async function askClaude(
       : '';
   if (captionText) userBlocks.push({ type: 'text', text: captionText });
 
+  // If images are attached, tell Claude their refs so it can pass them to
+  // upload_image_for_ad when the user asks for ad creation from media.
+  if (images && images.length > 0) {
+    const refs = images
+      .map((img, i) => `  img_${i}: ${img.media_type}, ~${Math.round((img.data.length * 3) / 4 / 1024)}KB`)
+      .join('\n');
+    userBlocks.push({
+      type: 'text',
+      text:
+        `[attached images registry — pass these refs to upload_image_for_ad when the user wants to create an ad from the image]\n${refs}\n\nBefore uploading: check for healthcare-policy-sensitive content (before/after weight loss imagery, body shots with text overlays claiming results, "lose X lbs" guarantees). If you see any of those, flag the policy risk to the user FIRST and confirm before calling upload_image_for_ad.`,
+    });
+  }
+
+  // Stash images for tool dispatch (resolveAttachedImage looks them up by chatId).
+  turnImages.set(chatId, images ?? []);
+
   // Build the message array: rolling history + session-context turn + current user turn.
   const messages: Anthropic.MessageParam[] = [
     ...priorHistory.map((m) => ({ role: m.role, content: m.content })),
@@ -3019,59 +3165,65 @@ async function askClaude(
   let assistantText = '';
   const MAX_HOPS = 8;
 
-  for (let hop = 0; hop < MAX_HOPS; hop++) {
-    const response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 1500,
-      system: [{ type: 'text', text: AGENT_MD, cache_control: { type: 'ephemeral' } }],
-      thinking: { type: 'adaptive' },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mixing custom + server-side tool types
-      tools: [...SERVER_SIDE_TOOLS, ...CUSTOM_TOOLS] as any,
-      messages,
-    });
+  try {
+    for (let hop = 0; hop < MAX_HOPS; hop++) {
+      const response = await anthropic.messages.create({
+        model: MODEL,
+        max_tokens: 1500,
+        system: [{ type: 'text', text: AGENT_MD, cache_control: { type: 'ephemeral' } }],
+        thinking: { type: 'adaptive' },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mixing custom + server-side tool types
+        tools: [...SERVER_SIDE_TOOLS, ...CUSTOM_TOOLS] as any,
+        messages,
+      });
 
-    // Append the full assistant turn (preserves tool_use blocks for the next iteration).
-    messages.push({ role: 'assistant', content: response.content });
+      // Append the full assistant turn (preserves tool_use blocks for the next iteration).
+      messages.push({ role: 'assistant', content: response.content });
 
-    if (response.stop_reason !== 'tool_use') {
-      assistantText = response.content
-        .filter((b): b is Anthropic.TextBlock => b.type === 'text')
-        .map((b) => b.text)
-        .join('\n')
-        .trim();
-      break;
-    }
-
-    // Execute every tool_use in this turn and feed results back.
-    const toolUseBlocks = response.content.filter(
-      (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use',
-    );
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const tu of toolUseBlocks) {
-      try {
-        const result = await dispatchToolGuarded(
-          tu.name,
-          tu.input as Record<string, unknown>,
-          chatId,
-          guardUserKey,
-          sender,
-        );
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: tu.id,
-          content: JSON.stringify(result).slice(0, 12_000),
-        });
-      } catch (err) {
-        const m = err instanceof Error ? err.message : String(err);
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: tu.id,
-          content: `error: ${m}`,
-          is_error: true,
-        });
+      if (response.stop_reason !== 'tool_use') {
+        assistantText = response.content
+          .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+          .map((b) => b.text)
+          .join('\n')
+          .trim();
+        break;
       }
+
+      // Execute every tool_use in this turn and feed results back.
+      const toolUseBlocks = response.content.filter(
+        (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use',
+      );
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      for (const tu of toolUseBlocks) {
+        try {
+          const result = await dispatchToolGuarded(
+            tu.name,
+            tu.input as Record<string, unknown>,
+            chatId,
+            guardUserKey,
+            sender,
+          );
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: JSON.stringify(result).slice(0, 12_000),
+          });
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: `error: ${m}`,
+            is_error: true,
+          });
+        }
+      }
+      messages.push({ role: 'user', content: toolResults });
     }
-    messages.push({ role: 'user', content: toolResults });
+  } finally {
+    // Always clear the per-turn image registry so subsequent turns can't
+    // accidentally upload stale bytes via a leftover ref.
+    turnImages.delete(chatId);
   }
 
   if (!assistantText) assistantText = '[no response]';

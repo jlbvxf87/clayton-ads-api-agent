@@ -444,6 +444,180 @@ interface AdCreativeFull {
   effective_object_story_id?: string;
 }
 
+// ---------- Image upload + ad-from-image creation ----------
+
+export interface UploadedImage {
+  image_hash: string;
+  url: string;
+  width: number | null;
+  height: number | null;
+}
+
+/**
+ * Upload an image to the ad account's media library. Returns the
+ * `image_hash` you can reference from `object_story_spec.link_data.image_hash`
+ * when creating a new ad creative.
+ *
+ * Meta dedupes by content hash — uploading the same bytes twice returns the
+ * same hash. Free, idempotent, and recommended dimensions are 1080x1080
+ * (square), 1200x628 (landscape), or 1080x1350 (vertical 4:5).
+ *
+ * Healthcare ads: Meta's automated policy review still runs once you USE the
+ * image in an ad. Upload doesn't trigger review; ad creation does. Flag
+ * policy-sensitive imagery (before/after, body shots, weight-claim overlays)
+ * before calling this — Meta will reject the ad post-create otherwise.
+ */
+export async function uploadImage(args: {
+  bytes: Buffer | string;             // Buffer or base64 string
+  mime_type?: string;                 // 'image/jpeg' | 'image/png' | 'image/gif'
+  filename?: string;
+  accountId?: string;
+}): Promise<UploadedImage> {
+  const acct = resolveAdAccount(args.accountId);
+  const buffer = Buffer.isBuffer(args.bytes) ? args.bytes : Buffer.from(args.bytes, 'base64');
+  if (buffer.length === 0) throw new Error('uploadImage: empty bytes');
+  if (buffer.length > 8 * 1024 * 1024) {
+    throw new Error(`uploadImage: image is ${(buffer.length / 1024 / 1024).toFixed(1)}MB, Meta limit is 8MB`);
+  }
+
+  // Meta accepts adimages via either `bytes` (base64 form field) or
+  // multipart file upload. The base64 form is simpler over HTTPS and
+  // doesn't require a multipart library — single POST.
+  const filename = args.filename ?? `upload_${Date.now()}.jpg`;
+  const form = new URLSearchParams();
+  form.set('bytes', buffer.toString('base64'));
+  form.set('name', filename);
+
+  const { data } = await meta.post(`/${acct}/adimages`, form, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    // Allow larger bodies — base64 inflates by ~33%, so an 8MB image is ~11MB encoded.
+    maxBodyLength: 20 * 1024 * 1024,
+    maxContentLength: 20 * 1024 * 1024,
+  });
+
+  // Response shape: { images: { "<keyed_by_filename_or_hash>": { hash, url, width, height } } }
+  const images = (data?.images ?? {}) as Record<string, { hash?: string; url?: string; width?: number; height?: number }>;
+  const first = Object.values(images)[0];
+  if (!first?.hash) {
+    throw new Error(`uploadImage: Meta did not return an image_hash. Response: ${JSON.stringify(data).slice(0, 300)}`);
+  }
+  return {
+    image_hash: first.hash,
+    url: first.url ?? '',
+    width: first.width ?? null,
+    height: first.height ?? null,
+  };
+}
+
+interface CreateAdFromImageArgs {
+  ad_set_id: string;                  // target ad set; new ad lands here as PAUSED
+  image_hash: string;                 // from uploadImage()
+  headline: string;                   // <= 40 chars recommended
+  primary_text: string;               // the main body / "message" in link_data
+  description?: string;               // optional secondary description text
+  cta?: string;                       // 'APPLY_NOW' | 'LEARN_MORE' | 'SIGN_UP' | 'GET_QUOTE' | etc.
+  link_url: string;                   // destination URL
+  ad_name?: string;
+  template_ad_id?: string;            // optional — borrow page_id + asset_feed_spec from a known-good ad
+}
+
+interface CreateAdFromImageResult {
+  new_ad_id: string;
+  new_creative_id: string;
+  template_ad_id: string | null;
+  page_id: string;
+}
+
+/**
+ * Build a new ad from an uploaded image. Inherits the Facebook Page id
+ * from a template ad (either an explicitly provided template_ad_id or the
+ * first existing ad in the target ad set) — no page_id env needed since
+ * the account always has running ads to borrow from.
+ *
+ * Always saves the new ad as PAUSED. The caller (or user via slash command)
+ * must explicitly resume it before it goes live.
+ */
+export async function createAdFromImage(args: CreateAdFromImageArgs): Promise<CreateAdFromImageResult> {
+  // 1. Find a template ad to inherit page_id from.
+  let templateAdId = args.template_ad_id ?? null;
+  if (!templateAdId) {
+    const adsInSet = await listAds(args.ad_set_id);
+    if (adsInSet.length === 0) {
+      throw new Error(
+        `createAdFromImage: ad set ${args.ad_set_id} has no existing ads to inherit page_id from. Pass template_ad_id explicitly (any ad in this account), or create the first ad of an ad set via Ads Manager UI.`,
+      );
+    }
+    templateAdId = adsInSet[0].id;
+  }
+
+  // 2. Fetch the template's creative for the page_id and any link_data shape we should preserve.
+  const templateAd = await getAd(templateAdId);
+  if (!templateAd?.creative?.id) {
+    throw new Error(`createAdFromImage: template ad ${templateAdId} has no creative attached`);
+  }
+  const templateCreative = await getCreative(templateAd.creative.id);
+  const templateSpec = (templateCreative.object_story_spec ?? {}) as Record<string, unknown>;
+  const pageId = (templateSpec.page_id as string) ?? null;
+  if (!pageId) {
+    throw new Error(
+      `createAdFromImage: template ad ${templateAdId} has no page_id in its object_story_spec — Meta requires a Facebook Page to attach the new ad to. Try a different template ad.`,
+    );
+  }
+
+  // 3. Build new object_story_spec from scratch (cleaner than mutating template).
+  const linkData: Record<string, unknown> = {
+    image_hash: args.image_hash,
+    link: args.link_url,
+    message: args.primary_text,
+    name: args.headline,
+  };
+  if (args.description) linkData.description = args.description;
+  if (args.cta) linkData.call_to_action = { type: args.cta, value: { link: args.link_url } };
+
+  const objectStorySpec = {
+    page_id: pageId,
+    link_data: linkData,
+  };
+
+  // 4. Create the new creative.
+  const newCreativeName = `${args.ad_name ?? 'image-upload'} — ${new Date().toISOString().slice(0, 10)}`;
+  const { data: newCreative } = await meta.post(
+    `/${resolveAdAccount()}/adcreatives`,
+    null,
+    {
+      params: {
+        name: newCreativeName,
+        object_story_spec: JSON.stringify(objectStorySpec),
+      },
+    },
+  );
+  const newCreativeId = newCreative?.id as string;
+  if (!newCreativeId) throw new Error('createAdFromImage: creative creation returned no id');
+
+  // 5. Create the new ad — PAUSED.
+  const newAdName = args.ad_name ?? `image-upload ${new Date().toISOString().slice(0, 10)}`;
+  const { data: newAd } = await meta.post(
+    `/${resolveAdAccount()}/ads`,
+    null,
+    {
+      params: {
+        name: newAdName,
+        adset_id: args.ad_set_id,
+        creative: JSON.stringify({ creative_id: newCreativeId }),
+        status: 'PAUSED',
+      },
+    },
+  );
+  if (!newAd?.id) throw new Error('createAdFromImage: ad creation returned no id');
+
+  return {
+    new_ad_id: newAd.id as string,
+    new_creative_id: newCreativeId,
+    template_ad_id: templateAdId,
+    page_id: pageId,
+  };
+}
+
 export async function getCreative(creativeId: string): Promise<AdCreativeFull> {
   const fields = [
     'id',
