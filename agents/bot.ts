@@ -3261,7 +3261,7 @@ async function askClaude(
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   // Photo messages have caption instead of text. Use whichever is present.
-  const text = (msg.text ?? msg.caption ?? '').trim();
+  let text = (msg.text ?? msg.caption ?? '').trim();
   const handle = msg.from?.username ?? msg.from?.first_name ?? String(msg.from?.id ?? 'unknown');
 
   // Detect image attachments early so we can route them through Claude even with no text.
@@ -3295,6 +3295,19 @@ bot.on('message', async (msg) => {
   const isGroupChat = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
   if (isGroupChat && isAddressedToGoogleClayton(text)) {
     return;
+  }
+  // If addressed to this bot explicitly (or with no addressee at all in a
+  // DM/group), strip our own @-mention plus the "clayton"/"meta" leading
+  // word so existing slash command equality checks and the LLM aren't
+  // tripped up by the addressing.
+  if (isGroupChat) {
+    text = text
+      .replace(/@clayton_metabot\b/gi, '')
+      .replace(/^meta\s+clayton[,:]?\s*/i, '')
+      .replace(/^meta[,:]?\s+/i, '')
+      .replace(/^clayton[,:]?\s+/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   // Per-user pending action: in groups, only the same user who started the
