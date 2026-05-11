@@ -235,6 +235,7 @@ async function extractImagesFromMessage(msg: TelegramBot.Message): Promise<Attac
 
 type PendingAction =
   | { kind: 'pause'; campaignId: string; campaignName: string }
+  | { kind: 'resume'; campaignId: string; campaignName: string }
   | {
       kind: 'budget';
       campaignId: string;
@@ -670,6 +671,36 @@ async function handlePauseCmd(chatId: number, userId: number | string, args: str
   );
 }
 
+// Mirror of /pause for the reverse direction. Deterministic path — bypasses
+// the LLM tool-selection step entirely, so a typo like 'B' (option button)
+// or a phrase containing extra words (e.g. "Yes resume ghost 500") can't
+// route to the wrong tool. Same single-confirmation flow as /pause.
+async function handleResumeCmd(chatId: number, userId: number | string, args: string): Promise<void> {
+  if (!args.trim()) {
+    await bot.sendMessage(chatId, 'Usage: /resume <campaign name or id>');
+    return;
+  }
+  const campaign = await findCampaignByQuery(args);
+  if (!campaign) {
+    await bot.sendMessage(chatId, `No campaign matched "${args}".`);
+    return;
+  }
+  const status = campaign.effective_status ?? campaign.status;
+  if (status === 'ACTIVE') {
+    await bot.sendMessage(chatId, `"${campaign.name}" is already ACTIVE. Nothing to resume.`);
+    return;
+  }
+  setPending(chatId, userId, {
+    kind: 'resume',
+    campaignId: campaign.id,
+    campaignName: campaign.name,
+  });
+  await bot.sendMessage(
+    chatId,
+    `Resume this campaign?\n${campaign.name}\nstatus ${status}\ndaily ${fmtMoney(campaign.daily_budget ? Number(campaign.daily_budget) : null)}\n\n**High blast radius** — verify Pixel + CIO are firing named events before resuming a paused campaign on this account (prior $24K/1-lead incident).\n\nReply confirm / yes / fire to proceed, or anything else to cancel.`,
+  );
+}
+
 async function handleBudgetCmd(chatId: number, userId: number | string, args: string): Promise<void> {
   const m = args.trim().match(/^(.+?)\s+\$?([\d.]+)$/);
   if (!m) {
@@ -782,6 +813,30 @@ const CONFIRM_REGEX =
   /\b(confirm|yes|yep|yeah|do it|go|go ahead|kill|kill it|stop|stop it|pause it|approve|approved|ok do|let'?s do|send it|fire|execute|proceed|scale it|boost it)\b/i;
 const CANCEL_REGEX = /\b(no|cancel|nope|nvm|nevermind|never mind|abort|skip|don'?t|hold|wait)\b/i;
 
+// Bare-only versions — strict allowlist of single utterances. Used for
+// auto-applying an open rebalance proposal so that a phrase like
+// "Yes resume ghost 500" (which CONTAINS "yes" but is clearly NOT a bare
+// confirmation of a different thing) does NOT hijack an unrelated open
+// rebalance plan. Compare to CONFIRM_REGEX/CANCEL_REGEX which are loose
+// substring matches.
+const BARE_CONFIRM_STRINGS = new Set<string>([
+  'yes', 'y', 'yep', 'yeah', 'ok', 'okay',
+  'confirm', 'confirmed', 'approve', 'approved',
+  'go', 'go ahead', 'do it', 'fire', 'execute', 'proceed',
+  'send it', "let's do it", 'lets do it', "let's go", 'lets go',
+]);
+const BARE_CANCEL_STRINGS = new Set<string>([
+  'no', 'n', 'nope', 'cancel', 'nvm', 'nevermind', 'never mind',
+  'abort', 'skip', 'hold', 'wait',
+]);
+
+function isBareConfirm(text: string): boolean {
+  return BARE_CONFIRM_STRINGS.has(text.trim().toLowerCase());
+}
+function isBareCancel(text: string): boolean {
+  return BARE_CANCEL_STRINGS.has(text.trim().toLowerCase());
+}
+
 function classifyReply(text: string): 'confirm' | 'cancel' | 'unclear' {
   const t = text.trim();
   if (CANCEL_REGEX.test(t)) return 'cancel';
@@ -814,7 +869,7 @@ async function executePending(
         typeof result === 'object' && result !== null
           ? JSON.stringify(result).slice(0, 600)
           : String(result);
-      await bot.sendMessage(chatId, `Confirmed: ${action.targetLabel}\n${summary}`);
+      await bot.sendMessage(chatId, `Done — ${action.targetLabel}.\n${summary}`);
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       await bot.sendMessage(chatId, `Failed to ${action.targetLabel}: ${m}`);
@@ -833,7 +888,7 @@ async function executePending(
         granted_at_chat_id: String(chatId),
         notes: action.notes,
       });
-      await bot.sendMessage(chatId, `Granted standing order — ${describePermission(p)}`);
+      await bot.sendMessage(chatId, `Saved. You won't be asked again for: ${describePermission(p)}`);
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       await bot.sendMessage(chatId, `Failed to grant: ${m}`);
@@ -881,6 +936,8 @@ async function executePending(
     let metaResp: unknown;
     if (action.kind === 'pause') {
       metaResp = await pauseCampaign(action.campaignId);
+    } else if (action.kind === 'resume') {
+      metaResp = await resumeCampaign(action.campaignId);
     } else {
       metaResp = await setDailyBudget(action.campaignId, action.newDailyBudgetCents);
     }
@@ -897,9 +954,11 @@ async function executePending(
     const summary =
       action.kind === 'pause'
         ? `Paused ${action.campaignName}.`
-        : action.kind === 'budget'
-          ? `Set ${action.campaignName} daily budget to ${fmtMoney(action.newDailyBudgetCents)}.`
-          : `Boosted ${action.campaignName} by ${action.percent}%: ${fmtMoney(action.oldDailyBudgetCents)} -> ${fmtMoney(action.newDailyBudgetCents)}.`;
+        : action.kind === 'resume'
+          ? `Resumed (set ACTIVE) ${action.campaignName}.`
+          : action.kind === 'budget'
+            ? `Set ${action.campaignName} daily budget to ${fmtMoney(action.newDailyBudgetCents)}.`
+            : `Boosted ${action.campaignName} by ${action.percent}%: ${fmtMoney(action.oldDailyBudgetCents)} -> ${fmtMoney(action.newDailyBudgetCents)}.`;
     await bot.sendMessage(chatId, summary);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -2253,7 +2312,7 @@ async function dispatchTool(
         expires_in_hours: input.expires_in_hours ?? 24,
         notes: input.notes ?? null,
         next_step:
-          "I have NOT granted this yet. The bot wrapper will stage a pending grant; the user must reply 'yes' to commit it.",
+          "Not granted yet. The system will show the user a YES/NO prompt. Emit NO further text on this turn — wait for their reply.",
       };
     }
     case 'revoke_permission': {
@@ -2262,7 +2321,7 @@ async function dispatchTool(
         permission_id: input.permission_id,
         reason: input.reason ?? null,
         next_step:
-          "I have NOT revoked yet. The wrapper will stage a pending revoke; the user must reply 'yes'.",
+          "Not revoked yet. The system will show the user a YES/NO prompt. Emit NO further text on this turn — wait for their reply.",
       };
     }
     default:
@@ -2816,27 +2875,27 @@ async function dispatchToolGuarded(
       targetLabel,
     });
   }
+  // Owner-facing prompt — plain English, no internal jargon. The system
+  // surfaces ONE clear "Reply YES" prompt. The agent must not generate
+  // additional follow-up text after this fires (see AGENT.md "user-facing
+  // language" rule and the next_step instruction below).
   await bot.sendMessage(
     chatId,
-    [
-      `I want to ${targetLabel}, but no standing order covers it.`,
-      guard.message,
-      '',
-      'Reply "yes" to confirm this one action, or grant a standing order:',
-      ...guard.suggested_grants.map((g) => `  ${g}`),
-    ].join('\n'),
+    `About to ${targetLabel}.\n\nReply YES to confirm, or anything else to cancel.`,
   );
   void sender; // reserved for future audit trail enrichment
   return {
     permission_required: true,
     kind: permKind,
     target: targetLabel,
-    why: guard.reason,
-    message: guard.message,
-    suggested_grants: guard.suggested_grants,
     pending_staged: Boolean(userKey),
+    // Internal cue only. The user has already been shown a plain-English
+    // confirmation prompt by the system; the agent must NOT emit any
+    // additional text — no commentary, no jargon, no "wrapper" or
+    // "standing order" or "permission gate" language. Output an empty text
+    // block on the next assistant turn and wait for the user's reply.
     next_step: userKey
-      ? "I asked the user to reply 'yes' or grant a standing order. Wait for their reply — do NOT call this tool again in this turn."
+      ? "STOP. The system has already shown the user a 'Reply YES to confirm' prompt. Emit NO text in your final response — just acknowledge silently. Do NOT mention wrappers, gates, permissions, standing orders, or rephrase what the prompt said. Wait for the user's reply."
       : 'Ask the user to confirm by re-issuing as a slash command.',
   };
 }
@@ -3094,12 +3153,22 @@ bot.on('message', async (msg) => {
     // Daily proposals live for ~12h until the next pass supersedes them, so
     // they can't ride the 5-min pending Map. A bare "yes" applies the most
     // recent proposed plan; "no" rejects it.
+    //
+    // CRITICAL: use isBareConfirm/isBareCancel here, NOT classifyReply. A
+    // phrase like "Yes resume ghost 500" matches classifyReply as 'confirm'
+    // because it contains the word "yes", but it is obviously NOT a bare
+    // confirmation of a stale open rebalance plan — it's a confirmation of
+    // a different action the user is teeing up. Auto-applying the rebalance
+    // in that case hijacks the user's actual intent (see 2026-05-11 Ghost
+    // incident: "Yes resume ghost 500" → applied empty rebalance #20
+    // instead of resuming the campaign).
     if (!text.startsWith('/')) {
-      const verdict = classifyReply(text);
-      if (verdict === 'confirm' || verdict === 'cancel') {
+      const isConfirm = isBareConfirm(text);
+      const isCancel = !isConfirm && isBareCancel(text);
+      if (isConfirm || isCancel) {
         const open = await loadOpenProposal();
         if (open && open.id != null) {
-          if (verdict === 'confirm') {
+          if (isConfirm) {
             await bot.sendChatAction(chatId, 'typing');
             try {
               const r = await applyRebalancePlan(open.id, `user:${senderUsername ?? senderId ?? 'unknown'}`);
@@ -3148,6 +3217,7 @@ bot.on('message', async (msg) => {
               '',
               'Write (gated, requires confirm reply):',
               '/pause <campaign>',
+              '/resume <campaign> (aliases: /activate, /on)',
               '/budget <campaign> <amount>',
               '/boost <campaign> <percent>',
               '',
@@ -3331,6 +3401,11 @@ bot.on('message', async (msg) => {
           return;
         case 'pause':
           await handlePauseCmd(chatId, userKey, args);
+          return;
+        case 'resume':
+        case 'activate':
+        case 'on':
+          await handleResumeCmd(chatId, userKey, args);
           return;
         case 'budget':
           await handleBudgetCmd(chatId, userKey, args);
@@ -3727,18 +3802,28 @@ bot.on('polling_error', (err) => {
 // the chat handler already uses. Schedules are in account-local TZ.
 
 const ENABLE_CRON = (process.env.ENABLE_CRON ?? 'true').toLowerCase() !== 'false';
+// User-facing pings (pulse briefings, rebalance proposals, LP ticks, CAPI
+// digests) are OFF by default. Set ENABLE_AUTO_PINGS=true in Railway to
+// re-enable. Slash commands (/briefing, /recap, /rebalance, /lp scan,
+// /lp measure, /capi, /monitor) work regardless — they trigger the same
+// code paths on demand. The silent background work (monitor tick every
+// 15min, CAPI tick every 10min) keeps running under ENABLE_CRON so Lead
+// attribution to Meta server-side stays intact.
+const ENABLE_AUTO_PINGS = (process.env.ENABLE_AUTO_PINGS ?? 'false').toLowerCase() === 'true';
 
 if (ENABLE_CRON) {
-  // Every 3 hours account-local — pulse check (broad summary).
-  // Fires at 0, 3, 6, 9, 12, 15, 18, 21 PT (8 times a day).
-  cron.schedule(
-    '0 */3 * * *',
-    () => {
-      console.log(`[cron] pulse firing at ${new Date().toISOString()}`);
-      runBriefing('pulse').catch((err) => console.error('pulse failed:', err));
-    },
-    { timezone: ACCOUNT_TZ },
-  );
+  if (ENABLE_AUTO_PINGS) {
+    // Every 3 hours account-local — pulse check (broad summary).
+    // Fires at 0, 3, 6, 9, 12, 15, 18, 21 PT (8 times a day).
+    cron.schedule(
+      '0 */3 * * *',
+      () => {
+        console.log(`[cron] pulse firing at ${new Date().toISOString()}`);
+        runBriefing('pulse').catch((err) => console.error('pulse failed:', err));
+      },
+      { timezone: ACCOUNT_TZ },
+    );
+  }
 
   // Every 15 minutes — fast monitor tick (delta detection, inbox, auto-act).
   cron.schedule(
@@ -3772,95 +3857,97 @@ if (ENABLE_CRON) {
     { timezone: ACCOUNT_TZ },
   );
 
-  // Daily 9 AM PT — morning rebalance proposal.
-  cron.schedule(
-    '0 9 * * *',
-    () => {
-      console.log(`[cron] morning rebalance firing at ${new Date().toISOString()}`);
-      runRebalanceTick('cron_morning')
-        .then((r) => console.log(`[rebalance] morning: plan_id=${r.plan_id} changes=${r.changes} metric=${r.metric}`))
-        .catch((err) => console.error('morning rebalance failed:', err));
-    },
-    { timezone: ACCOUNT_TZ },
-  );
-  // Daily 6 PM PT — evening rebalance proposal.
-  cron.schedule(
-    '0 18 * * *',
-    () => {
-      console.log(`[cron] evening rebalance firing at ${new Date().toISOString()}`);
-      runRebalanceTick('cron_evening')
-        .then((r) => console.log(`[rebalance] evening: plan_id=${r.plan_id} changes=${r.changes} metric=${r.metric}`))
-        .catch((err) => console.error('evening rebalance failed:', err));
-    },
-    { timezone: ACCOUNT_TZ },
-  );
+  if (ENABLE_AUTO_PINGS) {
+    // Daily 9 AM PT — morning rebalance proposal.
+    cron.schedule(
+      '0 9 * * *',
+      () => {
+        console.log(`[cron] morning rebalance firing at ${new Date().toISOString()}`);
+        runRebalanceTick('cron_morning')
+          .then((r) => console.log(`[rebalance] morning: plan_id=${r.plan_id} changes=${r.changes} metric=${r.metric}`))
+          .catch((err) => console.error('morning rebalance failed:', err));
+      },
+      { timezone: ACCOUNT_TZ },
+    );
+    // Daily 6 PM PT — evening rebalance proposal.
+    cron.schedule(
+      '0 18 * * *',
+      () => {
+        console.log(`[cron] evening rebalance firing at ${new Date().toISOString()}`);
+        runRebalanceTick('cron_evening')
+          .then((r) => console.log(`[rebalance] evening: plan_id=${r.plan_id} changes=${r.changes} metric=${r.metric}`))
+          .catch((err) => console.error('evening rebalance failed:', err));
+      },
+      { timezone: ACCOUNT_TZ },
+    );
 
-  // Mondays 8 AM PT — LP intelligence scrape (competitor first-scrolls).
-  // Weekly cadence: landing pages don't change daily; weekly catches the
-  // signal at a fraction of the cost.
-  cron.schedule(
-    '0 8 * * 1',
-    () => {
-      console.log(`[cron] LP scrape firing at ${new Date().toISOString()}`);
-      runDailyLpTick()
-        .then((r) =>
-          console.log(`[lp] scraped ${r.succeeded}/${r.total} analyzed=${r.analyzed} failed=${r.failed}`),
-        )
-        .catch((err) => console.error('LP scrape failed:', err));
-    },
-    { timezone: ACCOUNT_TZ },
-  );
-  // Daily 7 AM PT — LP lift measurement loop. Closes the feedback loop on
-  // any 'implemented' recommendation past its 14-day soak window.
-  cron.schedule(
-    '0 7 * * *',
-    () => {
-      console.log(`[cron] LP lift measurement firing at ${new Date().toISOString()}`);
-      runLiftMeasurementTick()
-        .then((r) =>
-          console.log(`[lp-lift] considered=${r.considered} measured=${r.measured} errors=${r.errors}`),
-        )
-        .catch((err) => console.error('LP lift measurement failed:', err));
-    },
-    { timezone: ACCOUNT_TZ },
-  );
+    // Mondays 8 AM PT — LP intelligence scrape (competitor first-scrolls).
+    // Weekly cadence: landing pages don't change daily; weekly catches the
+    // signal at a fraction of the cost.
+    cron.schedule(
+      '0 8 * * 1',
+      () => {
+        console.log(`[cron] LP scrape firing at ${new Date().toISOString()}`);
+        runDailyLpTick()
+          .then((r) =>
+            console.log(`[lp] scraped ${r.succeeded}/${r.total} analyzed=${r.analyzed} failed=${r.failed}`),
+          )
+          .catch((err) => console.error('LP scrape failed:', err));
+      },
+      { timezone: ACCOUNT_TZ },
+    );
+    // Daily 7 AM PT — LP lift measurement loop. Closes the feedback loop on
+    // any 'implemented' recommendation past its 14-day soak window.
+    cron.schedule(
+      '0 7 * * *',
+      () => {
+        console.log(`[cron] LP lift measurement firing at ${new Date().toISOString()}`);
+        runLiftMeasurementTick()
+          .then((r) =>
+            console.log(`[lp-lift] considered=${r.considered} measured=${r.measured} errors=${r.errors}`),
+          )
+          .catch((err) => console.error('LP lift measurement failed:', err));
+      },
+      { timezone: ACCOUNT_TZ },
+    );
 
-  // CAPI bridge digest — broadcasts last-24h forward totals, error rate,
-  // and sample customer emails (separating internal/test addresses) so
-  // silent regressions surface without anyone querying. Default target
-  // is the Clayton Meta Ads group (-5086989989) since Josh hasn't DM'd
-  // the bot. Override with TELEGRAM_DIGEST_CHAT_ID env var; set to "users"
-  // to fall back to broadcasting individual ALLOWED_USER_IDS.
-  const DIGEST_CHAT_ID = (process.env.TELEGRAM_DIGEST_CHAT_ID ?? '-5086989989').trim();
+    // CAPI bridge digest — broadcasts last-24h forward totals, error rate,
+    // and sample customer emails (separating internal/test addresses) so
+    // silent regressions surface without anyone querying. Default target
+    // is the Clayton Meta Ads group (-5086989989) since Josh hasn't DM'd
+    // the bot. Override with TELEGRAM_DIGEST_CHAT_ID env var; set to "users"
+    // to fall back to broadcasting individual ALLOWED_USER_IDS.
+    const DIGEST_CHAT_ID = (process.env.TELEGRAM_DIGEST_CHAT_ID ?? '-5086989989').trim();
 
-  async function fireCapiDigest(label: string): Promise<void> {
-    console.log(`[cron] capi digest (${label}) firing at ${new Date().toISOString()}`);
-    try {
-      const digest = await getCapiDigest(24);
-      const text = `[${label}]\n${formatCapiDigest(digest)}`;
-      const targets = DIGEST_CHAT_ID === 'users' ? [...ALLOWED_USER_IDS] : [DIGEST_CHAT_ID];
-      for (const t of targets) {
-        try {
-          await bot.sendMessage(t, text);
-        } catch (err) {
-          console.error(`[capi-digest] send to ${t} failed:`, err);
+    async function fireCapiDigest(label: string): Promise<void> {
+      console.log(`[cron] capi digest (${label}) firing at ${new Date().toISOString()}`);
+      try {
+        const digest = await getCapiDigest(24);
+        const text = `[${label}]\n${formatCapiDigest(digest)}`;
+        const targets = DIGEST_CHAT_ID === 'users' ? [...ALLOWED_USER_IDS] : [DIGEST_CHAT_ID];
+        for (const t of targets) {
+          try {
+            await bot.sendMessage(t, text);
+          } catch (err) {
+            console.error(`[capi-digest] send to ${t} failed:`, err);
+          }
         }
+        console.log(
+          `[capi-digest:${label}] total=${digest.total} ok=${digest.success} err=${digest.errors} internal=${digest.internal_emails.length}`,
+        );
+      } catch (err) {
+        console.error(`capi digest (${label}) failed:`, err);
       }
-      console.log(
-        `[capi-digest:${label}] total=${digest.total} ok=${digest.success} err=${digest.errors} internal=${digest.internal_emails.length}`,
-      );
-    } catch (err) {
-      console.error(`capi digest (${label}) failed:`, err);
     }
+
+    // Three pings/day so changes are visible morning, mid-day, and end-of-day.
+    cron.schedule('30 8 * * *', () => fireCapiDigest('morning 8:30 AM PT'), { timezone: ACCOUNT_TZ });
+    cron.schedule('0 13 * * *', () => fireCapiDigest('midday 1:00 PM PT'), { timezone: ACCOUNT_TZ });
+    cron.schedule('0 21 * * *', () => fireCapiDigest('evening 9:00 PM PT'), { timezone: ACCOUNT_TZ });
   }
 
-  // Three pings/day so changes are visible morning, mid-day, and end-of-day.
-  cron.schedule('30 8 * * *', () => fireCapiDigest('morning 8:30 AM PT'), { timezone: ACCOUNT_TZ });
-  cron.schedule('0 13 * * *', () => fireCapiDigest('midday 1:00 PM PT'), { timezone: ACCOUNT_TZ });
-  cron.schedule('0 21 * * *', () => fireCapiDigest('evening 9:00 PM PT'), { timezone: ACCOUNT_TZ });
-
   console.log(
-    `[cron] scheduled pulse 3h + monitor 15m + capi 10m + rebalance 9am,6pm + lp Mon 8am + lift daily 7am + capi digest 8:30am,1pm,9pm → ${DIGEST_CHAT_ID} in tz=${ACCOUNT_TZ}`,
+    `[cron] monitor 15m + capi 10m always-on. auto pings ${ENABLE_AUTO_PINGS ? 'ON — pulse/rebalance/lp/digest scheduled' : 'OFF (set ENABLE_AUTO_PINGS=true to re-enable)'} in tz=${ACCOUNT_TZ}`,
   );
 }
 
