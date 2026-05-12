@@ -860,22 +860,35 @@ function isBareCancel(text: string): boolean {
 /**
  * Two-bot routing in the shared Meta-Ads group: returns true when a
  * message is addressed to Google Clayton (@Clayton_googlebot) and this
- * bot (Clayton-Meta) should stay silent. Matches:
- *  - Slash command directed at Google Clayton: "/help@Clayton_googlebot ..."
- *  - @-mention as first token:                  "@Clayton_googlebot ..."
- *  - "google" or "google clayton" as the first word: "google, status today"
+ * bot (Clayton-Meta) should stay silent.
  *
- * Anything else routes to Clayton-Meta by default.
+ * Precedence:
+ *   1. Explicit Clayton/Meta address at the START always wins
+ *      ('clayton, X', 'meta, X', '/helpmeta', '@Clayton_metabot ...').
+ *      These force Clayton to handle even if 'google' also appears.
+ *   2. Otherwise, any of these route to Google Clayton:
+ *        - '/helpgoogle', '/statusgoogle', any slash suffixed with 'google'
+ *        - '/help@Clayton_googlebot' (slash with explicit Google @-handle)
+ *        - '@Clayton_googlebot ...' as first token
+ *        - the word 'google' appearing anywhere in the message
+ *   3. Anything else → Clayton-Meta (the default).
  */
 export function isAddressedToGoogleClayton(text: string): boolean {
   const t = text.toLowerCase().trim();
   if (!t) return false;
-  // Slash command targeting the Google Clayton bot's @-handle.
+
+  // Precedence 1: explicit Clayton/Meta address — overrides Google detection.
+  if (/^(clayton|meta\s+clayton|meta)[,:]?\s/.test(t)) return false;
+  if (/^\/[a-z_]+meta\b/.test(t)) return false;
+  if (/^\/[a-z_]+@clayton_metabot\b/.test(t)) return false;
+  if (/^@clayton_metabot\b/.test(t)) return false;
+
+  // Precedence 2: Google addressing.
+  if (/^\/[a-z_]+google\b/.test(t)) return true;
   if (/^\/[a-z_]+@clayton_googlebot\b/.test(t)) return true;
-  // @-mention as the first token.
   if (/^@clayton_googlebot\b/.test(t)) return true;
-  // Natural language: starts with "google" (optionally followed by "clayton").
-  if (/^google(\s+clayton)?\b/.test(t)) return true;
+  if (/\bgoogle\b/.test(t)) return true;
+
   return false;
 }
 
@@ -3296,13 +3309,14 @@ bot.on('message', async (msg) => {
   if (isGroupChat && isAddressedToGoogleClayton(text)) {
     return;
   }
-  // If addressed to this bot explicitly (or with no addressee at all in a
-  // DM/group), strip our own @-mention plus the "clayton"/"meta" leading
-  // word so existing slash command equality checks and the LLM aren't
-  // tripped up by the addressing.
+  // If addressed to this bot (or no platform mention at all), strip
+  // addressing artifacts so existing slash-command equality checks
+  // ('/help', '/status') match and the LLM isn't tripped by its own name
+  // in the input. Slash command shortcuts like '/helpmeta' become '/help'.
   if (isGroupChat) {
     text = text
       .replace(/@clayton_metabot\b/gi, '')
+      .replace(/^\/([a-z_]+)meta(\s|$)/i, '/$1$2')           // /helpmeta → /help
       .replace(/^meta\s+clayton[,:]?\s*/i, '')
       .replace(/^meta[,:]?\s+/i, '')
       .replace(/^clayton[,:]?\s+/i, '')
