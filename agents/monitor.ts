@@ -240,11 +240,13 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
 
 // ---------- Inbox persistence ----------
 
-async function upsertInboxItem(sig: DetectedSignal): Promise<{ id: number; isNew: boolean } | null> {
+async function upsertInboxItem(
+  sig: DetectedSignal,
+): Promise<{ id: number; isNew: boolean; lastSurfacedAt: string | null; lastSurfacedValue: number | null } | null> {
   // Look up an open row for the same kind+target.
   const { data: existing, error: readErr } = await supabase
     .from('agent_inbox')
-    .select('id, severity, surfaced_to_telegram')
+    .select('id, severity, surfaced_to_telegram, surfaced_at, current_value')
     .eq('signal_kind', sig.signal_kind)
     .eq('target_id', sig.target_id)
     .is('resolved_at', null)
@@ -271,7 +273,12 @@ async function upsertInboxItem(sig: DetectedSignal): Promise<{ id: number; isNew
       })
       .eq('id', existing.id);
     if (updErr) console.error('[MONITOR] inbox update failed:', updErr.message);
-    return { id: existing.id, isNew: false };
+    return {
+      id: existing.id,
+      isNew: false,
+      lastSurfacedAt: (existing.surfaced_at as string | null) ?? null,
+      lastSurfacedValue: existing.current_value != null ? Number(existing.current_value) : null,
+    };
   }
 
   const { data: inserted, error: insErr } = await supabase
@@ -294,7 +301,7 @@ async function upsertInboxItem(sig: DetectedSignal): Promise<{ id: number; isNew
     console.error('[MONITOR] inbox insert failed:', insErr?.message);
     return null;
   }
-  return { id: inserted.id as number, isNew: true };
+  return { id: inserted.id as number, isNew: true, lastSurfacedAt: null, lastSurfacedValue: null };
 }
 
 async function autoResolveSignalsThatStopped(active: DetectedSignal[]): Promise<number> {
@@ -466,13 +473,40 @@ function canonicalSurfaceText(inboxId: number, sig: DetectedSignal): string {
   return lines.join('\n');
 }
 
-function shouldSurface(sig: DetectedSignal, isNew: boolean): boolean {
-  // Critical: always surface.
-  if (sig.severity === 'critical') return true;
-  // Alert: surface on first detection only (re-detections update the row but don't re-ping).
-  if (sig.severity === 'alert' && isNew) return true;
-  // Notice / info: silent, visible via /inbox.
-  return false;
+const RESURFACE_HOURS: Record<Severity, number> = {
+  critical: 4,
+  alert: 8,
+  notice: Infinity,
+  info: Infinity,
+};
+
+function shouldSurface(
+  sig: DetectedSignal,
+  isNew: boolean,
+  lastSurfacedAt: string | null,
+  lastSurfacedValue: number | null,
+): boolean {
+  if (sig.severity === 'notice' || sig.severity === 'info') return false;
+
+  // First detection — always surface.
+  if (isNew || !lastSurfacedAt) return true;
+
+  const hoursSince = (Date.now() - new Date(lastSurfacedAt).getTime()) / 3_600_000;
+  const cooldown = RESURFACE_HOURS[sig.severity];
+
+  // Within cooldown window: only re-surface if spend has materially worsened (doubled).
+  if (hoursSince < cooldown) {
+    if (
+      lastSurfacedValue !== null &&
+      sig.current_value !== undefined &&
+      (sig.current_value ?? 0) >= lastSurfacedValue * 2
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  return true;
 }
 
 // ---------- Main tick ----------
@@ -507,7 +541,7 @@ export async function runMonitorTick(): Promise<{
       continue;
     }
 
-    if (shouldSurface(sig, up.isNew)) {
+    if (shouldSurface(sig, up.isNew, up.lastSurfacedAt, up.lastSurfacedValue)) {
       await surfaceItem(up.id, sig, autoActResult, tickJudgmentBudget);
       surfaced++;
     }
