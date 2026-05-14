@@ -671,7 +671,12 @@ async function handleCreativeCmd(chatId: number, args: string): Promise<void> {
 
 // ---------- Slash commands: writes (build pending) ----------
 
-async function handlePauseCmd(chatId: number, userId: number | string, args: string): Promise<void> {
+async function handlePauseCmd(
+  chatId: number,
+  userId: number | string,
+  args: string,
+  userHandle = String(userId),
+): Promise<void> {
   if (!args.trim()) {
     await bot.sendMessage(chatId, 'Usage: /pause <campaign name or id>');
     return;
@@ -681,15 +686,8 @@ async function handlePauseCmd(chatId: number, userId: number | string, args: str
     await bot.sendMessage(chatId, `No campaign matched "${args}".`);
     return;
   }
-  setPending(chatId, userId, {
-    kind: 'pause',
-    campaignId: campaign.id,
-    campaignName: campaign.name,
-  });
-  await bot.sendMessage(
-    chatId,
-    `Pause this campaign?\n${campaign.name}\nstatus ${campaign.effective_status ?? campaign.status}\ndaily ${fmtMoney(campaign.daily_budget ? Number(campaign.daily_budget) : null)}\n\nReply confirm / yes / kill it to proceed, or anything else to cancel.`,
-  );
+  // Pause is low-risk and reversible — execute immediately, no confirmation step.
+  await executePending(chatId, { kind: 'pause', campaignId: campaign.id, campaignName: campaign.name }, userHandle, '/pause');
 }
 
 // Mirror of /pause for the reverse direction. Deterministic path — bypasses
@@ -3627,7 +3625,7 @@ bot.on('message', async (msg) => {
             .catch((err) => bot.sendMessage(chatId, `Recap failed: ${err instanceof Error ? err.message : String(err)}`));
           return;
         case 'pause':
-          await handlePauseCmd(chatId, userKey, args);
+          await handlePauseCmd(chatId, userKey, args, handle);
           return;
         case 'resume':
         case 'activate':
