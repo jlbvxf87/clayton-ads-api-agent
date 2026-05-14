@@ -3280,6 +3280,11 @@ async function askClaude(
 // ---------- Router ----------
 
 bot.on('message', async (msg) => {
+  // Secondary instance (detected via 409 Conflict) must not process messages —
+  // both instances receive Telegram updates in a round-robin during deploy overlap,
+  // causing duplicate responses and [no response] noise.
+  if (isSecondaryCronInstance) return;
+
   const chatId = msg.chat.id;
   // Photo messages have caption instead of text. Use whichever is present.
   let text = (msg.text ?? msg.caption ?? '').trim();
