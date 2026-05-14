@@ -89,11 +89,16 @@ export async function pickMetric(): Promise<{ metric: Metric; reason: string }> 
   if (!cfg.enabled) return { metric: 'cpl', reason: 'CAPI bridge disabled — using CPL' };
 
   const maps = await listEventMap();
+  // Claya uses custom events: "Payment completed" = Purchase, "Request Submitted" = Lead.
+  // Accept any downstream conversion event (Purchase / Payment completed / Schedule / booking).
+  const BOOKING_EVENT_NAMES = new Set([
+    'Schedule', 'Purchase', 'Payment completed', 'booking_created', 'appointment_booked',
+  ]);
   const bookingMetaEvents = maps
-    .filter((m) => m.enabled && (m.meta_event_name === 'Schedule' || m.meta_event_name === 'Purchase'))
+    .filter((m) => m.enabled && BOOKING_EVENT_NAMES.has(m.meta_event_name))
     .map((m) => m.meta_event_name);
   if (bookingMetaEvents.length === 0) {
-    return { metric: 'cpl', reason: 'no Schedule/Purchase mapping in capi_event_map — using CPL' };
+    return { metric: 'cpl', reason: 'no booking/purchase mapping in capi_event_map — using CPL' };
   }
 
   const since = new Date(Date.now() - 14 * 86400 * 1000).toISOString();

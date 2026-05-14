@@ -2123,10 +2123,11 @@ async function dispatchTool(
       const totalClicks = accountBreakdown.reduce((s, r) => s + r.clicks, 0);
       const lpv = sumAction(accountBreakdown, 'landing_page_view');
       const viewContent = sumAction(accountBreakdown, 'view_content');
-      const addPayment = sumAction(accountBreakdown, 'add_payment_info');
-      const initiateCheckout = sumAction(accountBreakdown, 'initiate_checkout');
-      const metaLeads = sumAction(accountBreakdown, 'lead');
-      const metaPurchases = sumAction(accountBreakdown, 'purchase');
+      // Claya custom events — check both standard and custom action_type forms
+      const addPayment = sumAction(accountBreakdown, 'add_payment_info') || sumAction(accountBreakdown, 'offsite_conversion.custom.ADP01');
+      const initiateCheckout = sumAction(accountBreakdown, 'initiate_checkout') || sumAction(accountBreakdown, 'offsite_conversion.custom.CKT01');
+      const metaLeads = sumAction(accountBreakdown, 'lead') || sumAction(accountBreakdown, 'offsite_conversion.custom.Request_Submitted');
+      const metaPurchases = sumAction(accountBreakdown, 'purchase') || sumAction(accountBreakdown, 'offsite_conversion.custom.Payment_completed');
 
       let cioLeads = 0;
       let cioBookings = 0;

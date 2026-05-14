@@ -90,10 +90,21 @@ Homepage (`claya.com`) → "Get Started" → **37-screen intake** at `join.claya
 ### What this means for media buying
 
 1. **Massive lag between Meta click and CIO record.** Email is captured at screen 36 of 37. Most drop-off happens BEFORE email. So *"Meta reported 50 leads but CIO has 30 new records"* is the **expected** funnel-completion ratio, not a tracking bug. The Meta-to-CIO ratio = funnel completion rate. Treat them as different layers of the same funnel:
-   - **Meta lead** = whatever the Pixel fires on (could be intake start, mid-intake, or email submitted depending on the Pixel config)
-   - **CIO `lead` (or equivalent) event** = email captured at screen 36
-   - **CIO `appointment_booked` event** = downstream, post-checkout, post-doctor-consult
+   - **Meta lead** = `"Request Submitted"` custom event (action_type: `offsite_conversion.custom.Request_Submitted`)
+   - **CIO lead event** = email captured at screen 36 — exact CIO event name TBD (confirm via test submission)
+   - **CIO booking event** = downstream, post-checkout, post-doctor-consult — exact name TBD
    - **True CPB** = Meta spend ÷ CIO booking count, not ÷ Meta lead count.
+
+**Confirmed custom pixel event map (Josh, 2026-05-14):**
+| Standard Meta event | Claya custom event name | Meta action_type |
+|---|---|---|
+| Lead | Request Submitted | `offsite_conversion.custom.Request_Submitted` |
+| AddToCart | ATC01 | `offsite_conversion.custom.ATC01` |
+| InitiateCheckout | CKT01 | `offsite_conversion.custom.CKT01` |
+| AddPaymentInfo | ADP01 | `offsite_conversion.custom.ADP01` |
+| Purchase | Payment completed | `offsite_conversion.custom.Payment_completed` |
+
+Always use these custom names when reading action breakdowns or referencing funnel events. Standard event names (Lead, Purchase, etc.) will return 0 for Claya campaigns.
 
 2. **Two product paths with different LTV.**
    - **Semaglutide** — labeled "Most Affordable", 11.8K patients today
