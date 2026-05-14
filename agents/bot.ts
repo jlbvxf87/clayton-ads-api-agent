@@ -407,10 +407,18 @@ async function handleReport(chatId: number): Promise<void> {
 
 async function handleStatus(chatId: number): Promise<void> {
   await bot.sendChatAction(chatId, 'typing');
-  const [campaigns, todayInsights] = await Promise.all([
-    listCampaigns(),
-    getCampaignInsights('today'),
-  ]);
+  let campaigns: Awaited<ReturnType<typeof listCampaigns>>;
+  let todayInsights: Awaited<ReturnType<typeof getCampaignInsights>>;
+  try {
+    [campaigns, todayInsights] = await Promise.all([
+      listCampaigns(),
+      getCampaignInsights('today'),
+    ]);
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    await bot.sendMessage(chatId, `Failed to fetch campaign data from Meta: ${m}`);
+    return;
+  }
   const todayById = new Map(todayInsights.map((i) => [i.campaign_id, i] as const));
 
   if (campaigns.length === 0) {
@@ -430,13 +438,26 @@ async function handleStatus(chatId: number): Promise<void> {
   });
   rows.sort((a, b) => b.spendCents - a.spendCents);
 
-  const lines: string[] = ['Today (live)', ''];
-  for (const r of rows) {
-    lines.push(
-      `${r.name}  [${r.status}]`,
-      `  spend ${fmtMoney(r.spendCents)}  leads ${r.leads}  daily ${fmtMoney(r.dailyBudgetCents)}`,
-      '',
-    );
+  const active = rows.filter((r) => r.status === 'ACTIVE');
+  const inactive = rows.filter((r) => r.status !== 'ACTIVE');
+
+  const lines: string[] = [`Meta campaigns — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' })} PT`, ''];
+
+  if (active.length > 0) {
+    lines.push('ACTIVE');
+    for (const r of active) {
+      lines.push(
+        `  ${r.name}`,
+        `  spend ${fmtMoney(r.spendCents)}  leads ${r.leads}  daily ${fmtMoney(r.dailyBudgetCents)}`,
+        '',
+      );
+    }
+  }
+  if (inactive.length > 0) {
+    lines.push('OFF / PAUSED');
+    for (const r of inactive) {
+      lines.push(`  ${r.name}  [${r.status}]`);
+    }
   }
   await sendChunked(chatId, lines.join('\n'));
 }
