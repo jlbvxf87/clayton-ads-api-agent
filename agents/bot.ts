@@ -2864,15 +2864,9 @@ interface WriteToolSpec {
 }
 
 const WRITE_TOOL_SPECS: Record<string, WriteToolSpec> = {
-  pause_campaign: {
-    permKind: () => 'pause',
-    paramsFor: (i) => ({
-      campaign_id: i.campaign_id ? String(i.campaign_id) : null,
-      campaign_name: typeof i.campaign_name === 'string' ? i.campaign_name : null,
-    }),
-    targetLabel: (i) =>
-      `pause campaign ${typeof i.campaign_name === 'string' ? '"' + i.campaign_name + '"' : i.campaign_id}`,
-  },
+  // pause_campaign is intentionally NOT gated here — pause is low-risk and
+  // reversible. Consistent with /pause slash command which also executes
+  // immediately. The LLM can pause directly without a standing order.
   resume_campaign: {
     permKind: () => 'resume',
     paramsFor: (i) => ({
