@@ -180,7 +180,7 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
         ...targetBase,
         signal_kind: 'zero_leads',
         severity: sev,
-        current_value: 0,
+        current_value: todaySpend,  // spend, not leads — so de-dup doubled-check is meaningful
         baseline_value: null,
         delta_pct: null,
         message: `${c.campaign.name}: $${todaySpend.toFixed(0)} spent today, 0 leads`,
@@ -338,8 +338,46 @@ async function autoResolveSignalsThatStopped(active: DetectedSignal[]): Promise<
 async function attemptAutoAction(
   inboxId: number,
   sig: DetectedSignal,
-): Promise<{ acted: boolean; permId?: number; error?: string }> {
+): Promise<{ acted: boolean; permId?: number; emergency?: boolean; error?: string }> {
   if (!sig.recommended_action) return { acted: false };
+
+  // Emergency auto-pause: zero_leads + spend ≥ $300 bypasses the grant requirement.
+  // A campaign burning $300+ with zero leads is unambiguously broken — pause first, investigate after.
+  const todaySpend = typeof sig.data?.today_spend === 'number' ? (sig.data.today_spend as number) : 0;
+  if (
+    sig.signal_kind === 'zero_leads' &&
+    sig.recommended_action.tool === 'pause_campaign' &&
+    todaySpend >= 300
+  ) {
+    try {
+      await pauseCampaign(sig.recommended_action.params.campaign_id);
+      await supabase.from('agent_actions').insert({
+        chat_id: null,
+        user_handle: 'monitor:emergency',
+        command: 'auto:pause_campaign',
+        target_campaign_id: sig.recommended_action.params.campaign_id,
+        target_campaign_name: sig.recommended_action.params.campaign_name,
+        before_state: { signal_kind: sig.signal_kind, spend: todaySpend, leads: 0 },
+        success: true,
+        permission_id: null,
+      });
+      await supabase
+        .from('agent_inbox')
+        .update({
+          resolved_at: new Date().toISOString(),
+          resolved_by: 'auto:emergency_spend',
+          resolution_note: `emergency auto-paused — $${todaySpend.toFixed(0)} spent with 0 leads`,
+          auto_action_taken: true,
+        })
+        .eq('id', inboxId);
+      return { acted: true, emergency: true };
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      console.error('[MONITOR] emergency auto-pause failed:', m);
+      return { acted: false, error: m };
+    }
+  }
+
   const guard = await requirePermission(sig.recommended_action.kind, {
     campaign_id: sig.recommended_action.params.campaign_id,
     campaign_name: sig.recommended_action.params.campaign_name,
@@ -408,16 +446,20 @@ const JUDGMENT_PER_TICK_CAP = 3;
 async function surfaceItem(
   inboxId: number,
   sig: DetectedSignal,
-  autoActed: { acted: boolean; permId?: number; error?: string },
+  autoActed: { acted: boolean; permId?: number; emergency?: boolean; error?: string },
   tickJudgmentBudget: { remaining: number },
 ): Promise<void> {
   if (autoActed.acted) {
-    const text = `${SEVERITY_PREFIX[sig.severity]} auto-resolved: ${sig.message}\nStanding order #${autoActed.permId} covered this — paused automatically.`;
-    await notifyTelegram(text);
-    await supabase
+    const text = autoActed.emergency
+      ? `[EMERGENCY PAUSED] ${sig.message}\nSpend exceeded $300 with 0 leads — paused automatically. Check pixel/funnel before re-activating.`
+      : `${SEVERITY_PREFIX[sig.severity]} auto-resolved: ${sig.message}\nStanding order #${autoActed.permId} covered this — paused automatically.`;
+    // Mark surfaced_at before sending so cooldown holds even if Telegram fails.
+    const { error: markErr } = await supabase
       .from('agent_inbox')
       .update({ surfaced_to_telegram: true, surfaced_at: new Date().toISOString() })
       .eq('id', inboxId);
+    if (markErr) console.error('[MONITOR] surfaced_at update failed (auto-act):', markErr.message);
+    await notifyTelegram(text);
     return;
   }
 
@@ -432,9 +474,12 @@ async function surfaceItem(
     try {
       const r = await runJudgmentOnSignal(inboxId);
       if ('error' in r) {
-        text = canonicalSurfaceText(inboxId, sig);
+        text = canonicalSurfaceText(inboxId, sig, autoActed.error);
       } else {
         text = formatJudgmentForTelegram(r.judgment, sig.severity);
+        if (autoActed.error) {
+          text += `\n\n⚠️ Auto-pause attempted but failed: ${autoActed.error}`;
+        }
         await supabase
           .from('agent_judgments')
           .update({ surfaced_to_telegram: true, surfaced_at: new Date().toISOString() })
@@ -442,22 +487,28 @@ async function surfaceItem(
       }
     } catch (err) {
       console.error('[MONITOR] judgment loop failed:', err);
-      text = canonicalSurfaceText(inboxId, sig);
+      text = canonicalSurfaceText(inboxId, sig, autoActed.error);
     }
   } else {
-    text = canonicalSurfaceText(inboxId, sig);
+    text = canonicalSurfaceText(inboxId, sig, autoActed.error);
   }
 
-  await notifyTelegram(text);
-  await supabase
+  // Mark surfaced_at before sending so cooldown holds even if Telegram fails.
+  const { error: markErr } = await supabase
     .from('agent_inbox')
     .update({ surfaced_to_telegram: true, surfaced_at: new Date().toISOString() })
     .eq('id', inboxId);
+  if (markErr) console.error('[MONITOR] surfaced_at update failed:', markErr.message);
+  await notifyTelegram(text);
 }
 
-function canonicalSurfaceText(inboxId: number, sig: DetectedSignal): string {
+function canonicalSurfaceText(inboxId: number, sig: DetectedSignal, autoActError?: string): string {
   const lines: string[] = [];
   lines.push(`${SEVERITY_PREFIX[sig.severity]} ${sig.message}`);
+  if (autoActError) {
+    lines.push(`⚠️ Auto-pause was attempted but failed: ${autoActError}`);
+    lines.push(`Manual action required:`);
+  }
   if (sig.recommended_action) {
     lines.push(
       `Suggested: pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}.`,
