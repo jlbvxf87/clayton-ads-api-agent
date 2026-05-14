@@ -6,7 +6,6 @@ import {
   getCampaignInsights,
   pauseCampaign,
   extractLeads,
-  isThirdPartyOwnedError,
   type Campaign,
   type CampaignInsight,
 } from './meta.js';
@@ -375,11 +374,6 @@ async function attemptAutoAction(
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       console.error('[MONITOR] emergency auto-pause failed:', m);
-      // Ghost-managed campaigns can never be auto-paused — surface as a known
-      // limitation so the alert message skips the "retry /pause" suggestion.
-      if (isThirdPartyOwnedError(err)) {
-        return { acted: false, error: `GHOST_MANAGED:${m}` };
-      }
       return { acted: false, error: m };
     }
   }
@@ -512,12 +506,7 @@ function canonicalSurfaceText(inboxId: number, sig: DetectedSignal, autoActError
   const lines: string[] = [];
   lines.push(`${SEVERITY_PREFIX[sig.severity]} ${sig.message}`);
 
-  const isGhostBlocked = autoActError != null && (autoActError.startsWith('GHOST_MANAGED:') || isThirdPartyOwnedError(new Error(autoActError)));
-
-  if (isGhostBlocked) {
-    lines.push(`⚠️ Auto-pause blocked — this campaign is Ghost-managed. Meta does not allow API writes on campaigns created by third-party platforms.`);
-    lines.push(`Pause it directly in Ghost's dashboard.`);
-  } else if (autoActError) {
+  if (autoActError) {
     lines.push(`⚠️ Auto-pause attempted but failed: ${autoActError}`);
     if (sig.recommended_action) {
       lines.push(

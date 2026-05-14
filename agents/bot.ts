@@ -37,7 +37,6 @@ import {
   listCustomAudiences,
   createLookalikeAudience,
   AD_ACCOUNTS,
-  isThirdPartyOwnedError,
   type Campaign,
   type AdSet,
   type Ad,
@@ -1046,15 +1045,8 @@ async function executePending(
         meta_response: (fbBody as object | undefined) ?? null,
       })
       .eq('id', audit.id);
-    if (isThirdPartyOwnedError(err)) {
-      await bot.sendMessage(
-        chatId,
-        `Cannot pause ${action.kind === 'pause' ? action.campaignName : 'this campaign'} — it was created by Ghost (or another third-party platform) and Meta blocks API writes on campaigns it doesn't own.\n\nPause it directly in Ghost's dashboard. Clayton can monitor and alert on it but cannot modify it.`,
-      );
-    } else {
-      const detail = fbBody ? `\n${JSON.stringify(fbBody).slice(0, 800)}` : '';
-      await bot.sendMessage(chatId, `Meta API error:\n${errMsg}${detail}`);
-    }
+    const detail = fbBody ? `\n${JSON.stringify(fbBody).slice(0, 800)}` : '';
+    await bot.sendMessage(chatId, `Meta API error:\n${errMsg}${detail}`);
   }
 }
 
