@@ -436,8 +436,13 @@ export async function forwardAttributeChange(
 }
 
 async function logForward(row: Omit<CapiForward, 'id' | 'created_at'>): Promise<void> {
-  const { error } = await supabase.from('capi_forwards').insert(row);
-  if (error) console.error('[CAPI] logForward failed:', error.message);
+  const { error } = await supabase.from('capi_forwards').upsert(row, {
+    onConflict: 'cio_activity_id,meta_event_name',
+    ignoreDuplicates: true,
+  });
+  if (error && !error.message.includes('duplicate')) {
+    console.error('[CAPI] logForward failed:', error.message);
+  }
 }
 
 async function alreadyForwarded(activityId: string, metaEventId: string): Promise<boolean> {
