@@ -4006,8 +4006,20 @@ bot.on('message', async (msg) => {
   }
 });
 
+// True when Telegram reports a 409 Conflict — means a newer instance has
+// taken over polling (Railway deploy overlap). Suppress cron execution on
+// the outgoing instance so only one instance sends alerts and takes actions.
+let isSecondaryCronInstance = false;
+
 bot.on('polling_error', (err) => {
   console.error('polling error:', err);
+  const is409 = (err as { code?: string }).code === 'ETELEGRAM' && err.message?.includes('409');
+  if (is409 && !isSecondaryCronInstance) {
+    isSecondaryCronInstance = true;
+    console.warn('[CONFLICT] 409 from Telegram — another instance is primary. Suppressing cron actions until this process exits.');
+  } else if (!is409) {
+    isSecondaryCronInstance = false;
+  }
 });
 
 // ---------- Daily cron schedules (in-process) ----------
@@ -4043,6 +4055,10 @@ if (ENABLE_CRON) {
   cron.schedule(
     '*/15 * * * *',
     () => {
+      if (isSecondaryCronInstance) {
+        console.log('[cron] monitor tick SKIPPED — secondary instance (409 conflict)');
+        return;
+      }
       console.log(`[cron] monitor tick firing at ${new Date().toISOString()}`);
       runMonitorTick()
         .then((r) =>
@@ -4059,6 +4075,10 @@ if (ENABLE_CRON) {
   cron.schedule(
     '*/10 * * * *',
     () => {
+      if (isSecondaryCronInstance) {
+        console.log('[cron] capi tick SKIPPED — secondary instance (409 conflict)');
+        return;
+      }
       console.log(`[cron] capi tick firing at ${new Date().toISOString()}`);
       runCapiTick()
         .then((r) =>
