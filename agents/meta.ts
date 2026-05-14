@@ -201,6 +201,11 @@ const LEAD_ACTION_TYPES = new Set([
   'lead',
   'onsite_conversion.lead_grouped',
   'offsite_conversion.fb_pixel_lead',
+  // Claya uses custom pixel events instead of standard — "Request Submitted"
+  // fires where standard "Lead" would. Meta reports custom events as
+  // offsite_conversion.custom.{name_with_underscores}.
+  'offsite_conversion.custom.Request_Submitted',
+  'offsite_conversion.custom.request_submitted',
 ]);
 
 export function extractLeads(insight: CampaignInsight): number {
