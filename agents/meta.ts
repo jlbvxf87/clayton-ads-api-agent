@@ -220,10 +220,19 @@ export async function getAccountTimezone(): Promise<string> {
 }
 
 export async function pauseCampaign(campaignId: string): Promise<unknown> {
-  const { data } = await meta.post(`/${campaignId}`, null, {
-    params: { status: 'PAUSED' },
-  });
-  return data;
+  try {
+    const { data } = await meta.post(`/${campaignId}`, null, {
+      params: { status: 'PAUSED' },
+    });
+    return data;
+  } catch (err: unknown) {
+    // Surface the actual Meta error code/message, not just the HTTP status.
+    const metaError = (err as { response?: { data?: { error?: { code?: number; message?: string; error_subcode?: number } } } })?.response?.data?.error;
+    if (metaError) {
+      throw new Error(`Meta API error ${metaError.code ?? '?'}${metaError.error_subcode ? '/' + metaError.error_subcode : ''}: ${metaError.message ?? 'unknown'}`);
+    }
+    throw err;
+  }
 }
 
 export async function resumeCampaign(campaignId: string): Promise<unknown> {
