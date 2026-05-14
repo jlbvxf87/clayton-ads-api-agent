@@ -6,6 +6,7 @@ import {
   getCampaignInsights,
   pauseCampaign,
   extractLeads,
+  isThirdPartyOwnedError,
   type Campaign,
   type CampaignInsight,
 } from './meta.js';
@@ -505,11 +506,20 @@ async function surfaceItem(
 function canonicalSurfaceText(inboxId: number, sig: DetectedSignal, autoActError?: string): string {
   const lines: string[] = [];
   lines.push(`${SEVERITY_PREFIX[sig.severity]} ${sig.message}`);
-  if (autoActError) {
-    lines.push(`⚠️ Auto-pause was attempted but failed: ${autoActError}`);
-    lines.push(`Manual action required:`);
-  }
-  if (sig.recommended_action) {
+
+  const isGhostBlocked = autoActError != null && isThirdPartyOwnedError(new Error(autoActError));
+
+  if (isGhostBlocked) {
+    lines.push(`⚠️ Auto-pause blocked — this campaign is Ghost-managed. Meta does not allow API writes on campaigns created by third-party platforms.`);
+    lines.push(`Pause it directly in Ghost's dashboard.`);
+  } else if (autoActError) {
+    lines.push(`⚠️ Auto-pause attempted but failed: ${autoActError}`);
+    if (sig.recommended_action) {
+      lines.push(
+        `  Manual: /pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}`,
+      );
+    }
+  } else if (sig.recommended_action) {
     lines.push(
       `Suggested: pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}.`,
     );

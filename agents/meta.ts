@@ -219,6 +219,15 @@ export async function getAccountTimezone(): Promise<string> {
   return data.timezone_name as string;
 }
 
+// Subcode returned when the campaign was created by a third-party platform
+// (e.g. Ghost) and cannot be modified by our token.
+export const META_SUBCODE_THIRD_PARTY_OWNED = 4841021;
+
+export function isThirdPartyOwnedError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes(String(META_SUBCODE_THIRD_PARTY_OWNED));
+}
+
 export async function pauseCampaign(campaignId: string): Promise<unknown> {
   try {
     const { data } = await meta.post(`/${campaignId}`, null, {
