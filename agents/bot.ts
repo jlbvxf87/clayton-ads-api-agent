@@ -3286,10 +3286,13 @@ async function askClaude(
 // ---------- Router ----------
 
 bot.on('message', async (msg) => {
-  // Secondary instance (detected via 409 Conflict) must not process messages —
-  // both instances receive Telegram updates in a round-robin during deploy overlap,
-  // causing duplicate responses and [no response] noise.
-  if (isSecondaryCronInstance) return;
+  // Receiving a message means Telegram is routing updates to us — we are the
+  // active (primary) poller. Clear secondary flag in case it was set during
+  // deploy overlap when the old instance was still alive.
+  if (isSecondaryCronInstance) {
+    isSecondaryCronInstance = false;
+    console.log('[CONFLICT] Now receiving messages — transitioned to primary instance.');
+  }
 
   const chatId = msg.chat.id;
   // Photo messages have caption instead of text. Use whichever is present.
