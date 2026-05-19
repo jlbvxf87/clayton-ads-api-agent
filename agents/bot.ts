@@ -3998,6 +3998,162 @@ bot.on('message', async (msg) => {
           await sendChunked(chatId, lines.join('\n'));
           return;
         }
+        case 'launch': {
+          // Parse structured key: value lines from the message body
+          const launchLines = args.join('\n').split('\n');
+          const launchFields: Record<string, string> = {};
+          for (const line of launchLines) {
+            const colonIdx = line.indexOf(':');
+            if (colonIdx === -1) continue;
+            const k = line.slice(0, colonIdx).trim().toLowerCase().replace(/\s+/g, '_');
+            const v = line.slice(colonIdx + 1).trim();
+            if (k && v) launchFields[k] = v;
+          }
+
+          // Validate required fields
+          const requiredFields = ['image_url', 'headline', 'body', 'landing_page'];
+          const missingFields = requiredFields.filter(f => !launchFields[f]);
+          if (missingFields.length > 0) {
+            await bot.sendMessage(
+              chatId,
+              `❌ /launch is missing required fields: ${missingFields.join(', ')}\n\nPlease include all of: image_url, headline, body, landing_page.`,
+            );
+            return;
+          }
+
+          // Extract and apply defaults
+          const campaignName =
+            launchFields['campaign'] ??
+            `Demand Engine — ${new Date().toISOString().slice(0, 10)}`;
+          const objective = launchFields['objective'] ?? 'OUTCOME_LEADS';
+          const pixelId = launchFields['pixel'] ?? null;
+          const pixelEvent = launchFields['event'] ?? null;
+          const budgetUsd = launchFields['budget'] ? Number(launchFields['budget']) : 100;
+          const landingPage = launchFields['landing_page']!;
+          const headline = launchFields['headline']!;
+          const body = launchFields['body']!;
+          const cta = launchFields['cta'] ?? 'LEARN_MORE';
+          const imageUrl = launchFields['image_url']!;
+
+          // Parse targeting: age=25-55, location=US
+          let ageMin = 25;
+          let ageMax = 55;
+          let countries: string[] = ['US'];
+          const targetingRaw = launchFields['targeting'] ?? '';
+          if (targetingRaw) {
+            const targetingParts = targetingRaw.split(',').map(p => p.trim());
+            for (const part of targetingParts) {
+              const eqIdx = part.indexOf('=');
+              if (eqIdx === -1) continue;
+              const tk = part.slice(0, eqIdx).trim().toLowerCase();
+              const tv = part.slice(eqIdx + 1).trim();
+              if (tk === 'age') {
+                const ageParts = tv.split('-');
+                if (ageParts.length === 2) {
+                  ageMin = parseInt(ageParts[0], 10) || 25;
+                  ageMax = parseInt(ageParts[1], 10) || 55;
+                }
+              } else if (tk === 'location') {
+                countries = tv.split('|').map(c => c.trim()).filter(Boolean);
+              }
+            }
+          }
+          const targetingObj = {
+            age_min: ageMin,
+            age_max: ageMax,
+            geo_locations: { countries },
+          };
+
+          // Build promoted_object if pixel is set
+          const promotedObj = pixelId
+            ? { pixel_id: pixelId, custom_event_type: pixelEvent ?? 'LEAD' }
+            : null;
+
+          await bot.sendMessage(chatId, '🚀 Launch received. Building campaign...');
+
+          try {
+            // Download image
+            await bot.sendChatAction(chatId, 'typing');
+            const imgRes = await fetch(imageUrl);
+            const imgBuf = Buffer.from(await imgRes.arrayBuffer());
+
+            // Upload to Meta
+            await bot.sendChatAction(chatId, 'typing');
+            const uploaded = await uploadImage({
+              bytes: imgBuf,
+              mime_type: 'image/png',
+              filename: 'de-creative.png',
+            });
+
+            // Create campaign
+            await bot.sendChatAction(chatId, 'typing');
+            const campaign = await createCampaign({
+              name: campaignName,
+              objective: objective,
+              special_ad_categories: [],
+            });
+
+            // Create ad set
+            await bot.sendChatAction(chatId, 'typing');
+            const adSet = await createAdSet({
+              campaign_id: campaign.id,
+              name: `${campaignName} — Ad Set`,
+              daily_budget_cents: budgetUsd * 100,
+              optimization_goal: 'OFFSITE_CONVERSIONS',
+              billing_event: 'IMPRESSIONS',
+              targeting: targetingObj,
+              promoted_object: promotedObj ?? undefined,
+            });
+
+            // Look up a template ad from existing campaigns
+            await bot.sendChatAction(chatId, 'typing');
+            let templateAdId: string | null = null;
+            try {
+              const existingCampaigns = await listCampaigns();
+              const firstCampaign = existingCampaigns[0];
+              const adSets = firstCampaign ? await listAdSets(firstCampaign.id) : [];
+              const existingAds = adSets[0] ? await listAds(adSets[0].id) : [];
+              templateAdId = existingAds[0]?.id ?? null;
+            } catch {
+              // proceed without template
+            }
+
+            // Create ad
+            await bot.sendChatAction(chatId, 'typing');
+            const adResult = await createAdFromImage({
+              ad_set_id: adSet.id,
+              image_hash: uploaded.image_hash,
+              headline: headline,
+              primary_text: body,
+              cta: cta,
+              link_url: landingPage,
+              ad_name: campaignName,
+              template_ad_id: templateAdId ?? undefined,
+            });
+
+            await bot.sendMessage(
+              chatId,
+              [
+                '✅ Campaign built — PAUSED (review before activating)',
+                '',
+                `Campaign: ${campaignName} (id: ${campaign.id})`,
+                `Ad Set: id ${adSet.id}`,
+                `Ad: id ${adResult.id}`,
+                `Creative: id ${adResult.creative_id ?? 'n/a'}`,
+                `Budget: $${budgetUsd}/day`,
+                `Landing page: ${landingPage}`,
+                'Image: uploaded ✓',
+                '',
+                `To activate: /activate ${adResult.id}`,
+                'To view: check Ads Manager',
+              ].join('\n'),
+            );
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err);
+            await bot.sendMessage(chatId, `❌ Launch failed: ${m}`);
+          }
+          return;
+        }
         case 'grant':
           await handleGrantCmd(chatId, userKey, args);
           return;
