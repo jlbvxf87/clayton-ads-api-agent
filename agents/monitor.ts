@@ -341,42 +341,8 @@ async function attemptAutoAction(
 ): Promise<{ acted: boolean; permId?: number; emergency?: boolean; error?: string }> {
   if (!sig.recommended_action) return { acted: false };
 
-  // Emergency auto-pause: zero_leads + spend ≥ $300 bypasses the grant requirement.
-  // A campaign burning $300+ with zero leads is unambiguously broken — pause first, investigate after.
-  const todaySpend = typeof sig.data?.today_spend === 'number' ? (sig.data.today_spend as number) : 0;
-  if (
-    sig.signal_kind === 'zero_leads' &&
-    sig.recommended_action.tool === 'pause_campaign' &&
-    todaySpend >= 300
-  ) {
-    try {
-      await pauseCampaign(sig.recommended_action.params.campaign_id);
-      await supabase.from('agent_actions').insert({
-        chat_id: null,
-        user_handle: 'monitor:emergency',
-        command: 'auto:pause_campaign',
-        target_campaign_id: sig.recommended_action.params.campaign_id,
-        target_campaign_name: sig.recommended_action.params.campaign_name,
-        before_state: { signal_kind: sig.signal_kind, spend: todaySpend, leads: 0 },
-        success: true,
-        permission_id: null,
-      });
-      await supabase
-        .from('agent_inbox')
-        .update({
-          resolved_at: new Date().toISOString(),
-          resolved_by: 'auto:emergency_spend',
-          resolution_note: `emergency auto-paused — $${todaySpend.toFixed(0)} spent with 0 leads`,
-          auto_action_taken: true,
-        })
-        .eq('id', inboxId);
-      return { acted: true, emergency: true };
-    } catch (err) {
-      const m = err instanceof Error ? err.message : String(err);
-      console.error('[MONITOR] emergency auto-pause failed:', m);
-      return { acted: false, error: m };
-    }
-  }
+  // Auto-pause is DISABLED — Clayton alerts only, never acts without explicit user command.
+  // All writes require user permission via /pause or /grant standing order.
 
   const guard = await requirePermission(sig.recommended_action.kind, {
     campaign_id: sig.recommended_action.params.campaign_id,
