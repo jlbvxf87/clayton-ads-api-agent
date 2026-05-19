@@ -197,6 +197,72 @@ Healthcare-specific notes:
 
 ---
 
+## Industry Landscape & Market Intelligence
+
+Claya operates inside a broader ecosystem of telehealth / performance-health verticals. Clayton must understand this landscape to identify market moments, not just manage ad accounts.
+
+### The Verticals
+
+**GLP-1 / Weight Loss (Claya's primary vertical)**
+- Products: Compounded semaglutide (Ozempic/Wegovy equivalent), tirzepatide (Mounjaro/Zepbound equivalent)
+- Patient profile: Adults 35-65, BMI 27+, motivated by weight loss + metabolic health
+- Key dynamics: FDA compounding pharmacy regulations, drug shortage cycles, insurance coverage shifts, price sensitivity, stigma reduction driven by celebrity adoption
+- Competitors: Hims/Hers, Ro, Henry Meds, LifeMD, Found, Calibrate, TrimRx, Sequence
+- Regulatory watch: FDA 503A/503B compounding rules, shortage list status for semaglutide/tirzepatide
+- Ad angle trends: social proof ("I lost X lbs"), clinical credibility ("doctor-supervised"), affordability ("$149/mo"), speed ("see results in 4 weeks")
+
+**TRT / Testosterone Replacement Therapy**
+- Products: Testosterone cypionate/enanthate injections, topical gels, pellets
+- Patient profile: Men 35-60, symptoms of low T (fatigue, low libido, body composition changes)
+- Key dynamics: rising awareness of male hormonal health, "men's wellness" destigmatization, concierge telehealth expansion
+- Competitors: Hims, Roman, Maximus, Fountain TRT, Defy Medical, Evolve Telemed
+- Regulatory watch: DEA scheduling of testosterone, telemedicine prescribing rules by state
+- Ad angle trends: energy/performance framing, "reclaim your vitality", lab test hooks ("find out your T levels"), before/after body composition
+
+**Peptides (Adjacent, emerging)**
+- Products: BPC-157, TB-500, CJC-1295, Ipamorelin, PT-141, etc.
+- Patient profile: Biohackers, athletes, recovery-focused patients aged 28-55
+- Key dynamics: grey-market to regulated shift, compounding pharmacy overlap with GLP-1, "longevity" framing driving mainstream interest
+- Regulatory watch: FDA classification of research peptides, compounding rules
+- Ad angle trends: recovery, anti-aging, performance, research-backed framing
+
+**Joint Pain / Musculoskeletal (Adjacent)**
+- Products: PRP, stem cell concepts, anti-inflammatory protocols, peptide-assisted recovery
+- Patient profile: Active adults 40-70, athletes, post-injury patients
+- Key dynamics: underserved vs. athlete-focused content, insurance gap, cash-pay patient willingness
+- Ad angle trends: "back to doing what you love", mobility framing, sports credibility
+
+### Signal Sources to Monitor
+
+When Pack or Josh asks about the state of any vertical, or when running `/intel`, search across these sources:
+
+1. **News** — FDA announcements, clinical studies, pharma news, insurance coverage changes
+2. **Reddit** — r/Semaglutide, r/peptides, r/Testosterone, r/TRT, r/WeightLoss — patient sentiment, complaints, questions, pricing discussions
+3. **Competitor ad activity** — what's running in the Meta Ad Library, new entrants, messaging shifts
+4. **Google Trends** — search demand curves for target keywords
+5. **Social/TikTok signals** — viral moments, creator content patterns, trending hooks
+
+### `/intel <topic>` — On-Demand Market Intelligence
+
+When Pack or Josh asks "what's the state of TRT" or "research GLP-1 regulations" or types `/intel <topic>`, run a full multi-source landscape scan:
+
+1. Search recent news: `"<topic> 2026"`, `"<topic> FDA"`, `"<topic> telehealth"`
+2. Search patient sentiment: `site:reddit.com <topic>`, `"<topic> patient forum"`
+3. Search competitor moves: `"<topic> advertising"`, `"<topic> telehealth competitor"`
+4. Search regulatory: `"<topic> regulation"`, `"<topic> compounding pharmacy"`
+5. Synthesize into a structured brief:
+   - **What's happening now** (news, regulatory)
+   - **What patients are saying** (Reddit/forum sentiment)
+   - **What competitors are doing** (ad angles, new entrants)
+   - **Market opportunity signal** (what's underserved, what's trending)
+   - **Recommended ad angle** (what hook type fits this moment)
+
+Run 6-10 searches minimum for a full intel brief. Don't stop at one result. Chain searches to go deeper on anything interesting. Use `web_fetch` to pull full article text when a headline warrants deeper reading.
+
+This is not a summary of what you already know. It's a live read of what's happening right now. Search first, then synthesize.
+
+---
+
 ## Diagnostic framework
 
 When the user asks "how are we doing" or runs `/report`, walk this order:

@@ -3494,10 +3494,25 @@ bot.on('message', async (msg) => {
               'CIO upstream health:',
               '/cio — health check (events 24h/7d/30d, last seen, funnel state)',
               '',
+              'Market intelligence:',
+              '/intel <topic> — deep multi-source landscape scan (news, Reddit, competitors, regulatory)',
+              '  e.g. /intel TRT  |  /intel GLP-1 compounding  |  /intel semaglutide FDA 2026',
+              '',
               'Or ask anything in plain English. The agent has web search, can drill into ads, save observations, set goals, and create rules.',
             ].join('\n'),
           );
           return;
+        case 'intel':
+        case 'research':
+        case 'market': {
+          if (!args.trim()) {
+            await bot.sendMessage(chatId, 'Usage: /intel <topic>\nExamples:\n  /intel TRT\n  /intel GLP-1 compounding regulations\n  /intel semaglutide competitors 2026');
+            return;
+          }
+          // Route through Claude with explicit intel instruction so it chains searches
+          text = `Run a full market intelligence scan on: ${args.trim()}. Search news, Reddit patient sentiment, competitor activity, and regulatory landscape. Use web_search at least 6 times across different angles before synthesizing. Structure your response: What's happening now / What patients are saying / What competitors are doing / Market opportunity / Recommended ad angle.`;
+          break;
+        }
         case 'report':
           await handleReport(chatId);
           return;
