@@ -131,6 +131,13 @@ import {
   cioHealthCheck,
   CIO_CONFIGURED,
 } from './customerio.js';
+import {
+  demandEngineBrands,
+  demandEngineSpy,
+  demandEngineGenerate,
+  demandEngineBuildPage,
+  DEMAND_ENGINE_CONFIGURED,
+} from './demandengine.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1741,6 +1748,52 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
       required: ['kind'],
     },
   },
+  // ---------- Demand Engine tools ----------
+  {
+    name: 'demand_engine_brands',
+    description: "List all brands in the Demand Engine — slug, name, vertical, domain, angle, traffic type. Use to know what brands exist before running spy or generate.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'demand_engine_spy',
+    description: "Search Meta Ad Library via the Demand Engine for competitor ads in a vertical. Returns hook type, psychology, copy, landing page, days running, spend estimate. Use when researching what's winning in a market before generating a creative.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        keyword: { type: 'string', description: 'Search keyword or brand name, e.g. "GLP-1 weight loss" or "semaglutide"' },
+        vertical: { type: 'string', description: 'Vertical: glp1, trt, peptides, joint_pain, etc.' },
+        winner: { type: 'boolean', description: 'If true, filter to long-running / high-spend ads only (proven winners).' },
+      },
+      required: ['keyword', 'vertical'],
+    },
+  },
+  {
+    name: 'demand_engine_generate',
+    description: "Generate a complete ad creative (headline, body, CTA, composite image) via the Demand Engine. Returns image_url ready to upload to Meta. Use after spy to create a creative targeting a winning angle.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        brandSlug: { type: 'string', description: 'Brand slug from demand_engine_brands, e.g. "claya"' },
+        vertical: { type: 'string', description: 'Vertical: glp1, trt, peptides, joint_pain, etc.' },
+        hookType: { type: 'string', description: 'Hook psychology type, e.g. "fear_transfer", "social_proof", "price_anchor", "authority", "transformation"' },
+        landingPage: { type: 'string', description: 'Full URL where the ad sends traffic.' },
+      },
+      required: ['brandSlug', 'vertical', 'hookType', 'landingPage'],
+    },
+  },
+  {
+    name: 'demand_engine_build_page',
+    description: "Build a landing page for a brand via the Demand Engine. Returns the live page URL. Use when a brand needs a new funnel page before launching a campaign.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        brandSlug: { type: 'string', description: 'Brand slug from demand_engine_brands.' },
+        funnelType: { type: 'string', description: 'Type of page: quiz, advertorial, vsl, lander, etc.' },
+        referenceIntel: { type: 'string', description: 'Optional: intel from spy or market research to inform the page copy and angle.' },
+      },
+      required: ['brandSlug', 'funnelType'],
+    },
+  },
   {
     name: 'revoke_permission',
     description:
@@ -2492,6 +2545,36 @@ async function dispatchTool(
         next_step:
           "Not revoked yet. The system will show the user a YES/NO prompt. Emit NO further text on this turn — wait for their reply.",
       };
+    }
+    // ---------- Demand Engine tools ----------
+    case 'demand_engine_brands': {
+      if (!DEMAND_ENGINE_CONFIGURED) return { error: 'DEMAND_ENGINE_URL or MACHINE_API_KEY not set in Railway.' };
+      return await demandEngineBrands();
+    }
+    case 'demand_engine_spy': {
+      if (!DEMAND_ENGINE_CONFIGURED) return { error: 'DEMAND_ENGINE_URL or MACHINE_API_KEY not set in Railway.' };
+      return await demandEngineSpy({
+        keyword: String(input.keyword),
+        vertical: String(input.vertical),
+        winner: Boolean(input.winner ?? false),
+      });
+    }
+    case 'demand_engine_generate': {
+      if (!DEMAND_ENGINE_CONFIGURED) return { error: 'DEMAND_ENGINE_URL or MACHINE_API_KEY not set in Railway.' };
+      return await demandEngineGenerate({
+        brandSlug: String(input.brandSlug),
+        vertical: String(input.vertical),
+        hookType: String(input.hookType),
+        landingPage: String(input.landingPage),
+      });
+    }
+    case 'demand_engine_build_page': {
+      if (!DEMAND_ENGINE_CONFIGURED) return { error: 'DEMAND_ENGINE_URL or MACHINE_API_KEY not set in Railway.' };
+      return await demandEngineBuildPage({
+        brandSlug: String(input.brandSlug),
+        funnelType: String(input.funnelType),
+        referenceIntel: input.referenceIntel ? String(input.referenceIntel) : undefined,
+      });
     }
     default:
       throw new Error(`unknown tool: ${name}`);
@@ -4015,7 +4098,7 @@ bot.on('message', async (msg) => {
         }
         case 'launch': {
           // Parse structured key: value lines from the message body
-          const launchLines = args.join('\n').split('\n');
+          const launchLines = args.split('\n');
           const launchFields: Record<string, string> = {};
           for (const line of launchLines) {
             const colonIdx = line.indexOf(':');
@@ -4153,13 +4236,13 @@ bot.on('message', async (msg) => {
                 '',
                 `Campaign: ${campaignName} (id: ${campaign.id})`,
                 `Ad Set: id ${adSet.id}`,
-                `Ad: id ${adResult.id}`,
-                `Creative: id ${adResult.creative_id ?? 'n/a'}`,
+                `Ad: id ${adResult.new_ad_id}`,
+                `Creative: id ${adResult.new_creative_id}`,
                 `Budget: $${budgetUsd}/day`,
                 `Landing page: ${landingPage}`,
                 'Image: uploaded ✓',
                 '',
-                `To activate: /activate ${adResult.id}`,
+                `To activate: /activate ${adResult.new_ad_id}`,
                 'To view: check Ads Manager',
               ].join('\n'),
             );
@@ -4307,6 +4390,42 @@ if (ENABLE_CRON) {
       },
       { timezone: ACCOUNT_TZ },
     );
+
+    // Wednesdays 7 AM PT — Demand Engine market scan.
+    // Pulls active brands, runs spy on each vertical, surfaces opportunities
+    // in Telegram only when something actionable is found.
+    if (DEMAND_ENGINE_CONFIGURED) {
+      cron.schedule(
+        '0 7 * * 3',
+        async () => {
+          console.log(`[cron] demand engine market scan firing at ${new Date().toISOString()}`);
+          try {
+            const brands = await demandEngineBrands();
+            if (!brands.length) return;
+            const verticals = [...new Set(brands.map((b) => b.vertical).filter(Boolean))];
+            const recipients = (process.env.BRIEFING_CHAT_IDS ?? '-5086989989')
+              .split(',').map((s) => s.trim()).filter(Boolean);
+            for (const vertical of verticals.slice(0, 3)) {
+              const winners = await demandEngineSpy({ keyword: vertical, vertical, winner: true });
+              if (!winners.length) continue;
+              const top = winners[0];
+              const msg = [
+                `[MARKET SCAN] ${vertical.toUpperCase()} — ${winners.length} active competitor ads found`,
+                `Top hook: ${top.hook_type ?? 'unknown'} — running ${top.days_running ?? '?'} days`,
+                top.headline ? `Headline: "${top.headline}"` : null,
+                `\nTell me "generate a ${vertical} creative" to build an ad targeting this angle.`,
+              ].filter(Boolean).join('\n');
+              for (const cid of recipients) {
+                await bot.sendMessage(cid, msg).catch(() => {});
+              }
+            }
+          } catch (err) {
+            console.error('[cron] demand engine market scan failed:', err);
+          }
+        },
+        { timezone: ACCOUNT_TZ },
+      );
+    }
 
     // Mondays 8 AM PT — LP intelligence scrape (competitor first-scrolls).
     // Weekly cadence: landing pages don't change daily; weekly catches the
