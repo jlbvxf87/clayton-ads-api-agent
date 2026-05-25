@@ -208,6 +208,30 @@ const LEAD_ACTION_TYPES = new Set([
   'offsite_conversion.custom.request_submitted',
 ]);
 
+// Every known Claya funnel event, keyed by Meta action_type.
+// stage = funnel position (lower = earlier), isLead = counts toward CPL.
+export const CLAYA_FUNNEL_STEPS: Record<string, { label: string; stage: number; isLead: boolean }> = {
+  'offsite_conversion.custom.ViewedProofScreen': { label: 'Viewed Proof Screen', stage: 2, isLead: false },
+  'offsite_conversion.custom.Request_Submitted':  { label: 'Request Submitted (Lead)', stage: 5, isLead: true },
+  'offsite_conversion.custom.request_submitted':  { label: 'Request Submitted (Lead)', stage: 5, isLead: true },
+  'offsite_conversion.custom.ATC01':              { label: 'Add to Cart', stage: 6, isLead: false },
+  'offsite_conversion.custom.CKT01':              { label: 'Initiate Checkout', stage: 6, isLead: false },
+  'offsite_conversion.custom.ADP01':              { label: 'Add Payment Info', stage: 7, isLead: false },
+  'offsite_conversion.custom.Payment_completed':  { label: 'Payment Completed', stage: 8, isLead: false },
+};
+
+// Returns every funnel step count seen in an insight row.
+export function extractFunnelSteps(insight: CampaignInsight): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!insight.actions) return out;
+  for (const a of insight.actions) {
+    if (CLAYA_FUNNEL_STEPS[a.action_type]) {
+      out[a.action_type] = (out[a.action_type] ?? 0) + (Number(a.value) || 0);
+    }
+  }
+  return out;
+}
+
 export function extractLeads(insight: CampaignInsight): number {
   if (!insight.actions) return 0;
   let total = 0;

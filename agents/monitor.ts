@@ -6,6 +6,8 @@ import {
   getCampaignInsights,
   pauseCampaign,
   extractLeads,
+  extractFunnelSteps,
+  CLAYA_FUNNEL_STEPS,
   type Campaign,
   type CampaignInsight,
 } from './meta.js';
@@ -33,7 +35,8 @@ export type SignalKind =
   | 'zero_leads'
   | 'ctr_drop'
   | 'spend_velocity'
-  | 'frequency_creep';
+  | 'frequency_creep'
+  | 'funnel_step_silent';
 
 export type Severity = 'info' | 'notice' | 'alert' | 'critical';
 
@@ -231,6 +234,31 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
           message: `${c.campaign.name}: spent $${todaySpend.toFixed(0)} of $${dailyBudget.toFixed(0)} budget by hour ${hoursIn.toFixed(1)} (${ratio.toFixed(1)}× expected pace)`,
           data: { hours_in: hoursIn, daily_budget: dailyBudget },
         });
+      }
+    }
+
+    // 5. Funnel step silent — a known mid-funnel event fired in the last 7d but
+    //    has gone quiet today while the campaign is still spending. One signal
+    //    per event type per campaign. Only fires after $15 spend today.
+    if (todaySpend >= 15 && c.today && c.last7d) {
+      const todaySteps = extractFunnelSteps(c.today);
+      const wkSteps = extractFunnelSteps(c.last7d);
+      for (const [actionType, meta] of Object.entries(CLAYA_FUNNEL_STEPS)) {
+        if (meta.isLead) continue; // zero_leads already covers lead events
+        const wkCount = wkSteps[actionType] ?? 0;
+        const todayCount = todaySteps[actionType] ?? 0;
+        if (wkCount > 0 && todayCount === 0) {
+          out.push({
+            ...targetBase,
+            signal_kind: 'funnel_step_silent',
+            severity: 'notice',
+            current_value: 0,
+            baseline_value: wkCount,
+            delta_pct: -100,
+            message: `${c.campaign.name}: "${meta.label}" fired ${wkCount} times last 7d — 0 today with $${todaySpend.toFixed(0)} spent`,
+            data: { action_type: actionType, step_label: meta.label, wk_count: wkCount, today_spend: todaySpend },
+          });
+        }
       }
     }
   }
