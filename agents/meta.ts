@@ -211,7 +211,11 @@ const LEAD_ACTION_TYPES = new Set([
 // Every known Claya funnel event, keyed by Meta action_type.
 // stage = funnel position (lower = earlier), isLead = counts toward CPL.
 export const CLAYA_FUNNEL_STEPS: Record<string, { label: string; stage: number; isLead: boolean }> = {
-  'offsite_conversion.custom.ViewedProofScreen': { label: 'Viewed Proof Screen', stage: 2, isLead: false },
+  // Meta rolls ALL custom pixel events into this key at campaign/adset level.
+  // Individual event names (ViewedProofScreen, ATC01, etc.) only appear when
+  // querying at the ad level with filtering, or via Custom Conversions.
+  'offsite_conversion.fb_pixel_custom':           { label: 'Custom Pixel Events (all)', stage: 2, isLead: false },
+  'offsite_conversion.custom.ViewedProofScreen':  { label: 'Viewed Proof Screen', stage: 2, isLead: false },
   'offsite_conversion.custom.Request_Submitted':  { label: 'Request Submitted (Lead)', stage: 5, isLead: true },
   'offsite_conversion.custom.request_submitted':  { label: 'Request Submitted (Lead)', stage: 5, isLead: true },
   'offsite_conversion.custom.ATC01':              { label: 'Add to Cart', stage: 6, isLead: false },
@@ -434,6 +438,7 @@ export async function getActionBreakdown(
     fields: ACTION_BREAKDOWN_FIELDS_BY_LEVEL[level],
     level,
     date_preset: datePreset,
+    action_breakdowns: '["action_type"]',
     limit: '500',
   });
   return rows.map((r) => {
