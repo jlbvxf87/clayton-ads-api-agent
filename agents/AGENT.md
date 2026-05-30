@@ -106,17 +106,21 @@ Homepage (`claya.com`) → "Get Started" → **37-screen intake** at `join.claya
    - **CIO booking event** = downstream, post-checkout, post-doctor-consult — exact name TBD
    - **True CPB** = Meta spend ÷ CIO booking count, not ÷ Meta lead count.
 
-**Confirmed custom pixel event map:**
-| Standard Meta event | Claya custom event name | Meta action_type | Funnel stage |
+**Confirmed custom pixel event map (all 5 Custom Conversions live as of 2026-05-30):**
+| Event | Pixel event name | Custom Conversion ID | Funnel stage |
 |---|---|---|---|
-| ViewContent (mid-funnel) | ViewedProofScreen | `offsite_conversion.custom.ViewedProofScreen` | Proof screens (~step 7-25) |
-| Lead | Request Submitted | `offsite_conversion.custom.Request_Submitted` | Screen 36 — email capture |
-| AddToCart | ATC01 | `offsite_conversion.custom.ATC01` | Checkout entry |
-| InitiateCheckout | CKT01 | `offsite_conversion.custom.CKT01` | Checkout entry |
-| AddPaymentInfo | ADP01 | `offsite_conversion.custom.ADP01` | Plan selection |
-| Purchase | Payment completed | `offsite_conversion.custom.Payment_completed` | Completed checkout |
+| ViewedProofScreen | `ViewedProofScreen` | — (no CC created) | Proof screens (~step 7-25) |
+| Lead | `Request Submitted` | `1624617625264072` | Screen 36 — email capture |
+| Add to Cart | `ATC01` | `3403597826484179` | Checkout entry |
+| Initiate Checkout | `CKT01` | `1011041691345583` | Checkout entry |
+| Add Payment Info | `ADP01` | `966980039537177` | Plan selection |
+| Purchase | `Purchase` (standard) | `1000572159117566` | Completed checkout |
 
-**ViewedProofScreen** is a mid-funnel signal — it fires when a user reaches one of the social proof screens inside the 37-screen intake. It's not a lead, but it matters: proof screen → lead conversion rate tells you how hard the bottom of the funnel is working. If a campaign is optimizing toward ViewedProofScreen instead of Request Submitted, that's a misaligned objective — flag it. The monitor watches for this event going silent (fired last 7d but zero today with active spend).
+Note on Purchase: `Payment_completed` custom event hasn't fired recently enough to appear in the dropdown, so the CC maps to the standard `Purchase` event instead. When `Payment_completed` fires consistently, create a new CC tied to that custom event.
+
+In the Insights API, once campaigns use these CCs as their objective, they appear as `offsite_conversion.custom.{ID}`. Both the named event keys and the ID keys are tracked in `CLAYA_FUNNEL_STEPS` in `meta.ts`.
+
+**ViewedProofScreen** fires when a user hits the social proof screens inside the 37-step intake. Not a lead — a mid-funnel signal. If a campaign optimizes toward it instead of Lead — Request Submitted, that's a misaligned objective — flag it immediately.
 
 Always use these custom names when reading action breakdowns or referencing funnel events. Standard event names (Lead, Purchase, etc.) will return 0 for Claya campaigns.
 

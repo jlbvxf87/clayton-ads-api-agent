@@ -27,7 +27,7 @@ export function resolveAdAccount(accountId?: string): string {
 // Backward-compat alias used throughout the file.
 const AD_ACCOUNT = DEFAULT_AD_ACCOUNT;
 
-const META_API_VERSION = 'v21.0';
+const META_API_VERSION = 'v25.0';
 const baseURL = `https://graph.facebook.com/${META_API_VERSION}`;
 
 const meta: AxiosInstance = axios.create({
@@ -201,27 +201,36 @@ const LEAD_ACTION_TYPES = new Set([
   'lead',
   'onsite_conversion.lead_grouped',
   'offsite_conversion.fb_pixel_lead',
-  // Claya uses custom pixel events instead of standard — "Request Submitted"
-  // fires where standard "Lead" would. Meta reports custom events as
-  // offsite_conversion.custom.{name_with_underscores}.
   'offsite_conversion.custom.Request_Submitted',
   'offsite_conversion.custom.request_submitted',
+  // Custom Conversion ID for Lead — Request Submitted (created 2026-05-30)
+  'offsite_conversion.custom.1624617625264072',
 ]);
 
 // Every known Claya funnel event, keyed by Meta action_type.
 // stage = funnel position (lower = earlier), isLead = counts toward CPL.
+// Custom Conversion IDs (cc_id.*) are how these appear once Meta has enough
+// signal — they're the same events as the named keys above, just reported
+// differently once Custom Conversions are active in Ads Manager.
 export const CLAYA_FUNNEL_STEPS: Record<string, { label: string; stage: number; isLead: boolean }> = {
-  // Meta rolls ALL custom pixel events into this key at campaign/adset level.
-  // Individual event names (ViewedProofScreen, ATC01, etc.) only appear when
-  // querying at the ad level with filtering, or via Custom Conversions.
-  'offsite_conversion.fb_pixel_custom':           { label: 'Custom Pixel Events (all)', stage: 2, isLead: false },
-  'offsite_conversion.custom.ViewedProofScreen':  { label: 'Viewed Proof Screen', stage: 2, isLead: false },
-  'offsite_conversion.custom.Request_Submitted':  { label: 'Request Submitted (Lead)', stage: 5, isLead: true },
-  'offsite_conversion.custom.request_submitted':  { label: 'Request Submitted (Lead)', stage: 5, isLead: true },
-  'offsite_conversion.custom.ATC01':              { label: 'Add to Cart', stage: 6, isLead: false },
-  'offsite_conversion.custom.CKT01':              { label: 'Initiate Checkout', stage: 6, isLead: false },
-  'offsite_conversion.custom.ADP01':              { label: 'Add Payment Info', stage: 7, isLead: false },
-  'offsite_conversion.custom.Payment_completed':  { label: 'Payment Completed', stage: 8, isLead: false },
+  // Rolled-up fallback — Meta aggregates all custom events here at campaign level
+  'offsite_conversion.fb_pixel_custom':              { label: 'Custom Pixel Events (all)', stage: 2, isLead: false },
+  // Named pixel events
+  'offsite_conversion.custom.ViewedProofScreen':     { label: 'Viewed Proof Screen', stage: 2, isLead: false },
+  'offsite_conversion.custom.Request_Submitted':     { label: 'Lead — Request Submitted', stage: 5, isLead: true },
+  'offsite_conversion.custom.request_submitted':     { label: 'Lead — Request Submitted', stage: 5, isLead: true },
+  'offsite_conversion.custom.ATC01':                 { label: 'Add to Cart', stage: 6, isLead: false },
+  'offsite_conversion.custom.CKT01':                 { label: 'Initiate Checkout', stage: 6, isLead: false },
+  'offsite_conversion.custom.ADP01':                 { label: 'Add Payment Info', stage: 7, isLead: false },
+  'offsite_conversion.custom.Payment_completed':     { label: 'Payment Completed', stage: 8, isLead: false },
+  'offsite_conversion.custom.purchase':              { label: 'Payment Completed', stage: 8, isLead: false },
+  // Custom Conversion IDs (created 2026-05-30) — how Meta reports these once
+  // the custom conversions are active and campaigns use them as objectives
+  'offsite_conversion.custom.1624617625264072':      { label: 'Lead — Request Submitted', stage: 5, isLead: true },
+  'offsite_conversion.custom.3403597826484179':      { label: 'Add to Cart (ATC01)', stage: 6, isLead: false },
+  'offsite_conversion.custom.1011041691345583':      { label: 'Initiate Checkout (CKT01)', stage: 6, isLead: false },
+  'offsite_conversion.custom.966980039537177':       { label: 'Add Payment Info (ADP01)', stage: 7, isLead: false },
+  'offsite_conversion.custom.1000572159117566':      { label: 'Payment Completed (Purchase)', stage: 8, isLead: false },
 };
 
 // Returns every funnel step count seen in an insight row.
