@@ -18,13 +18,23 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 
 // ---------- Tunables ----------
 
-const BAND_TOP_THRESHOLD = 0.7;       // metric ≤ 70% of account avg → top
-const BAND_BOTTOM_THRESHOLD = 1.3;    // metric ≥ 130% of account avg → bottom
+// Phase 3: 70/20/10 portfolio tiers
+const WINNER_CPL_THRESHOLD = 0.70;        // adjusted CPL ≤ 70% of avg → winner tier
+const UNDERPERFORMER_CPL_THRESHOLD = 1.40; // adjusted CPL ≥ 140% of avg → underperformer
+const WINNER_MIN_LEADS = 30;              // need ≥30 leads for winner eligibility
+const EXPERIMENT_MAX_LEADS = 15;          // ≤15 leads → experiment tier (learning phase)
+const WINNER_BUMP_PCT = 30;               // winners get +30%
+const UNDERPERFORMER_CUT_PCT = 20;        // underperformers get -20%
+const EXPERIMENT_BUDGET_CAP_CENTS = 5_000; // $50/day hard cap on experiments
+const BAYESIAN_PRIOR_WEIGHT = 20;         // shrinks toward account avg with <20 leads
+// Legacy tunables kept for clampDelta guardrail
+const BAND_TOP_THRESHOLD = 0.7;
+const BAND_BOTTOM_THRESHOLD = 1.3;
 const TOP_BUMP_PCT = 20;
 const BOTTOM_CUT_PCT = 20;
-const MAX_CHANGE_PCT_PER_PASS = 50;   // Sprint 1 hard guardrail
-const MIN_DAILY_BUDGET_CENTS = 500;   // $5/day floor
-const MAX_DAILY_BUDGET_CENTS = 50000; // $500/day ceiling per single change
+const MAX_CHANGE_PCT_PER_PASS = 50;
+const MIN_DAILY_BUDGET_CENTS = 500;
+const MAX_DAILY_BUDGET_CENTS = 50000;
 const MIN_DAYS_ACTIVE = 3;
 const MIN_LEADS_WINDOW = 20;
 const CPB_MIN_FORWARDS_14D = 30;
@@ -33,6 +43,7 @@ const CPB_MIN_FORWARDS_14D = 30;
 
 export type Metric = 'cpl' | 'cpb';
 export type Band = 'top' | 'middle' | 'bottom' | 'skip_insufficient_data' | 'skip_open_signal';
+export type PortfolioTier = 'winner' | 'testing' | 'experiment' | 'underperformer';
 
 export interface CampaignMetrics {
   campaign_id: string;
@@ -45,6 +56,8 @@ export interface CampaignMetrics {
   cpl_window: number | null;
   cpb_window: number | null;
   metric_value: number | null;
+  adjusted_metric: number | null; // Bayesian-shrunk toward account avg
+  portfolio_tier: PortfolioTier | null;
   band: Band;
   reason: string;
   has_open_signal: boolean;
@@ -178,6 +191,27 @@ async function loadOpenSignalCampaignIds(): Promise<Set<string>> {
   return ids;
 }
 
+// ---------- Bayesian confidence ----------
+
+function bayesianAdjust(rawMetric: number, sampleSize: number, accountAvg: number): number {
+  // Shrinks raw metric toward account average when sample is small.
+  // With 20 leads the estimate is 50/50 raw vs prior; at 100 leads it's 83% raw.
+  return (sampleSize * rawMetric + BAYESIAN_PRIOR_WEIGHT * accountAvg) / (sampleSize + BAYESIAN_PRIOR_WEIGHT);
+}
+
+function classifyPortfolioTier(
+  adjusted: number,
+  leads: number,
+  accountAvg: number,
+): PortfolioTier {
+  if (leads <= EXPERIMENT_MAX_LEADS) return 'experiment';
+  if (leads < WINNER_MIN_LEADS) return 'testing';
+  const ratio = adjusted / accountAvg;
+  if (ratio <= WINNER_CPL_THRESHOLD) return 'winner';
+  if (ratio >= UNDERPERFORMER_CPL_THRESHOLD) return 'underperformer';
+  return 'testing';
+}
+
 // ---------- Banding ----------
 
 interface AssembledMetrics {
@@ -233,6 +267,8 @@ async function assembleMetrics(): Promise<AssembledMetrics> {
       cpl_window: cpl,
       cpb_window: cpb,
       metric_value: metricValue,
+      adjusted_metric: null, // filled in after account avg is known
+      portfolio_tier: null,  // filled in after account avg is known
       band,
       reason: reasonStr,
       has_open_signal: hasOpenSignal,
@@ -251,20 +287,35 @@ async function assembleMetrics(): Promise<AssembledMetrics> {
     account_avg = totalCount > 0 ? totalSpend / totalCount : null;
   }
 
-  // Now classify into top/middle/bottom
+  // Classify into legacy band (backward compat) AND portfolio tier (Phase 3)
   if (account_avg != null) {
     for (const r of rows) {
       if (r.band !== 'middle') continue;
-      const ratio = (r.metric_value ?? 0) / account_avg;
+      const raw = r.metric_value!;
+      const sampleSize = metric === 'cpl' ? r.leads_window : r.bookings_window;
+      const adjusted = bayesianAdjust(raw, sampleSize, account_avg);
+      r.adjusted_metric = adjusted;
+      r.portfolio_tier = classifyPortfolioTier(adjusted, sampleSize, account_avg);
+
+      // Legacy band (kept for backward compat with stored plan JSON)
+      const ratio = adjusted / account_avg;
       if (ratio <= BAND_TOP_THRESHOLD) {
         r.band = 'top';
-        r.reason = `${metric.toUpperCase()} $${r.metric_value!.toFixed(0)} vs account avg $${account_avg.toFixed(0)} (${Math.round((1 - ratio) * 100)}% better)`;
       } else if (ratio >= BAND_BOTTOM_THRESHOLD) {
         r.band = 'bottom';
-        r.reason = `${metric.toUpperCase()} $${r.metric_value!.toFixed(0)} vs account avg $${account_avg.toFixed(0)} (${Math.round((ratio - 1) * 100)}% worse)`;
       } else {
         r.band = 'middle';
-        r.reason = `${metric.toUpperCase()} $${r.metric_value!.toFixed(0)} within ±30% of avg $${account_avg.toFixed(0)}`;
+      }
+
+      const confNote = sampleSize < WINNER_MIN_LEADS ? ` (${sampleSize} leads, Bayesian-adjusted)` : '';
+      const tierLabel = r.portfolio_tier ? ` [${r.portfolio_tier.toUpperCase()}]` : '';
+      r.reason = `${metric.toUpperCase()} raw $${raw.toFixed(0)} → adj $${adjusted.toFixed(0)} vs avg $${account_avg.toFixed(0)}${confNote}${tierLabel}`;
+    }
+    // Campaigns skipped for data get experiment tier
+    for (const r of rows) {
+      if (r.band === 'skip_insufficient_data') {
+        r.portfolio_tier = 'experiment';
+        r.adjusted_metric = null;
       }
     }
   }
@@ -286,24 +337,57 @@ function clampDelta(currentCents: number, deltaPct: number): { newCents: number;
 function buildChanges(rows: CampaignMetrics[]): ProposedChange[] {
   const out: ProposedChange[] = [];
   for (const r of rows) {
-    if (r.band !== 'top' && r.band !== 'bottom') continue;
     const current = r.current_daily_cents ?? 0;
     if (current <= 0) continue;
-    const target = r.band === 'top' ? TOP_BUMP_PCT : -BOTTOM_CUT_PCT;
-    const { newCents, effectivePct } = clampDelta(current, target);
-    if (newCents === current) continue;
-    out.push({
-      campaign_id: r.campaign_id,
-      campaign_name: r.campaign_name,
-      current_daily_cents: current,
-      proposed_daily_cents: newCents,
-      delta_cents: newCents - current,
-      delta_pct: effectivePct,
-      band: r.band,
-      metric_value: r.metric_value,
-      reason: r.reason,
-      applied: false,
-    });
+
+    const tier = r.portfolio_tier;
+
+    if (tier === 'winner') {
+      const { newCents, effectivePct } = clampDelta(current, WINNER_BUMP_PCT);
+      if (newCents === current) continue;
+      out.push({
+        campaign_id: r.campaign_id,
+        campaign_name: r.campaign_name,
+        current_daily_cents: current,
+        proposed_daily_cents: newCents,
+        delta_cents: newCents - current,
+        delta_pct: effectivePct,
+        band: r.band,
+        metric_value: r.metric_value,
+        reason: r.reason,
+        applied: false,
+      });
+    } else if (tier === 'underperformer') {
+      const { newCents, effectivePct } = clampDelta(current, -UNDERPERFORMER_CUT_PCT);
+      if (newCents === current) continue;
+      out.push({
+        campaign_id: r.campaign_id,
+        campaign_name: r.campaign_name,
+        current_daily_cents: current,
+        proposed_daily_cents: newCents,
+        delta_cents: newCents - current,
+        delta_pct: effectivePct,
+        band: r.band,
+        metric_value: r.metric_value,
+        reason: r.reason,
+        applied: false,
+      });
+    } else if (tier === 'experiment' && current > EXPERIMENT_BUDGET_CAP_CENTS) {
+      // Cap experiments that have crept above the experiment ceiling
+      out.push({
+        campaign_id: r.campaign_id,
+        campaign_name: r.campaign_name,
+        current_daily_cents: current,
+        proposed_daily_cents: EXPERIMENT_BUDGET_CAP_CENTS,
+        delta_cents: EXPERIMENT_BUDGET_CAP_CENTS - current,
+        delta_pct: ((EXPERIMENT_BUDGET_CAP_CENTS - current) / current) * 100,
+        band: r.band,
+        metric_value: r.metric_value,
+        reason: r.reason + ' — capped at $50/day experiment limit',
+        applied: false,
+      });
+    }
+    // testing tier → no change (protected)
   }
   return out;
 }
@@ -327,14 +411,15 @@ export async function generateRebalanceProposal(
 
   const skippedSignal = assembled.rows.filter((r) => r.band === 'skip_open_signal').length;
   const skippedData = assembled.rows.filter((r) => r.band === 'skip_insufficient_data').length;
-  const middle = assembled.rows.filter((r) => r.band === 'middle').length;
+  const winnerCount = assembled.rows.filter((r) => r.portfolio_tier === 'winner').length;
+  const testingCount = assembled.rows.filter((r) => r.portfolio_tier === 'testing').length;
+  const experimentCount = assembled.rows.filter((r) => r.portfolio_tier === 'experiment').length;
+  const underperformerCount = assembled.rows.filter((r) => r.portfolio_tier === 'underperformer').length;
 
   const rationale =
-    `metric=${assembled.metric.toUpperCase()} (${assembled.metric_reason}). ` +
-    `${changes.length} change${changes.length === 1 ? '' : 's'} proposed across ` +
-    `${assembled.rows.filter((r) => r.band === 'top').length} top + ` +
-    `${assembled.rows.filter((r) => r.band === 'bottom').length} bottom. ` +
-    `${middle} middle untouched, ${skippedSignal} skipped for open signals, ${skippedData} skipped for insufficient data.`;
+    `Portfolio: ${winnerCount} winner, ${testingCount} testing (held), ${experimentCount} experiment, ${underperformerCount} underperformer. ` +
+    `Bayesian prior=${BAYESIAN_PRIOR_WEIGHT} leads. ` +
+    `${skippedSignal} skipped (open signal), ${skippedData} skipped (no data).`;
 
   const plan: RebalancePlan = {
     generated_by: generatedBy,
@@ -489,33 +574,56 @@ export function formatPlanForTelegram(plan: RebalancePlan): string {
   const tag = plan.generated_by === 'cron_morning' ? 'Morning rebalance' :
               plan.generated_by === 'cron_evening' ? 'Evening rebalance' :
               plan.generated_by === 'manual' ? 'Manual rebalance' : 'Rebalance';
-  lines.push(`${tag} proposal #${plan.id} — metric=${plan.metric.toUpperCase()}`);
+  lines.push(`${tag} #${plan.id} — 70/20/10 portfolio — metric=${plan.metric.toUpperCase()}`);
   lines.push(`(${plan.metric_reason})`);
   lines.push('');
+
   if (plan.changes.length === 0) {
-    lines.push('No changes proposed — every active campaign is within ±30% of account avg, or skipped.');
+    lines.push('No changes — all campaigns are in testing tier or within range.');
     lines.push('');
     lines.push(plan.rationale);
     return lines.join('\n');
   }
+
   lines.push(
-    `Total daily: ${fmt$(plan.total_daily_before_cents)} → ${fmt$(plan.total_daily_after_cents)} ` +
-      `(${plan.total_daily_after_cents >= plan.total_daily_before_cents ? '+' : ''}${fmt$(plan.total_daily_after_cents - plan.total_daily_before_cents)})`,
+    `Budget: ${fmt$(plan.total_daily_before_cents)}/day → ${fmt$(plan.total_daily_after_cents)}/day ` +
+    `(${plan.total_daily_after_cents >= plan.total_daily_before_cents ? '+' : ''}${fmt$(plan.total_daily_after_cents - plan.total_daily_before_cents)})`,
   );
   lines.push('');
-  for (const c of plan.changes) {
-    const arrow = c.delta_cents >= 0 ? '+' : '';
-    lines.push(
-      `${c.band === 'top' ? '↑' : '↓'} ${c.campaign_name}: ${fmt$(c.current_daily_cents)} → ${fmt$(c.proposed_daily_cents)} (${arrow}${c.delta_pct.toFixed(0)}%)`,
-    );
-    lines.push(`   ${c.reason}`);
+
+  // Group changes by tier for cleaner readability
+  const winners = plan.changes.filter((c) => c.band === 'top');
+  const underperformers = plan.changes.filter((c) => c.band === 'bottom');
+  const experiments = plan.changes.filter((c) => c.band !== 'top' && c.band !== 'bottom');
+
+  if (winners.length > 0) {
+    lines.push('WINNERS — scaling up (Bayesian-confirmed):');
+    for (const c of winners) {
+      lines.push(`  ↑ ${c.campaign_name}: ${fmt$(c.current_daily_cents)} → ${fmt$(c.proposed_daily_cents)} (+${c.delta_pct.toFixed(0)}%)`);
+      lines.push(`    ${c.reason}`);
+    }
+    lines.push('');
   }
-  lines.push('');
+  if (underperformers.length > 0) {
+    lines.push('UNDERPERFORMERS — trimming:');
+    for (const c of underperformers) {
+      lines.push(`  ↓ ${c.campaign_name}: ${fmt$(c.current_daily_cents)} → ${fmt$(c.proposed_daily_cents)} (${c.delta_pct.toFixed(0)}%)`);
+      lines.push(`    ${c.reason}`);
+    }
+    lines.push('');
+  }
+  if (experiments.length > 0) {
+    lines.push('EXPERIMENTS — budget capped:');
+    for (const c of experiments) {
+      lines.push(`  = ${c.campaign_name}: ${fmt$(c.current_daily_cents)} → ${fmt$(c.proposed_daily_cents)}`);
+      lines.push(`    ${c.reason}`);
+    }
+    lines.push('');
+  }
+
   lines.push(plan.rationale);
   lines.push('');
-  lines.push(
-    `Reply "yes" to apply all, /rebalance reject ${plan.id} to dismiss. Auto-expires when next pass runs.`,
-  );
+  lines.push(`Reply "yes" to apply, /rebalance reject ${plan.id} to dismiss.`);
   return lines.join('\n');
 }
 
