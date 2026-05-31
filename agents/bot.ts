@@ -75,6 +75,14 @@ import {
   getCreativePerformanceByAngle,
 } from './creative.js';
 import {
+  runCohortTick,
+  getLatestCohort,
+  listCohortHistory,
+  discoverCohortEventMap,
+  setCohortEventOverride,
+  formatCohortForTelegram,
+} from './cohorts.js';
+import {
   runMonitorTick,
   listOpenInbox,
   listRecentInbox,
@@ -1812,6 +1820,26 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'get_cohort_summary',
+    description:
+      "Pull the latest customer quality cohort snapshot: leads, intake completion, approval rate, rebill count, rebill rate %, CPL, and CPB. Use when the user asks about customer quality, rebill rates, CPB, retention, or whether campaigns are actually producing paying customers. Also returns the CIO event map so you know what events are tracked. If rebill_count is 0 and rebill event is 'not found', tell the user we need to set the rebill event name with /cohorts set rebill <name>.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        date_preset: {
+          type: 'string',
+          enum: ['today', 'yesterday', 'last_7d', 'last_30d'],
+          description: 'Window to pull cohort data for. Default last_7d.',
+        },
+        refresh: {
+          type: 'boolean',
+          description: 'If true, re-query Meta + CIO now instead of reading last saved snapshot.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'revoke_permission',
     description:
       "PROPOSE revoking a standing-order permission. User must reply 'yes' to confirm. Pass the permission id from list_permissions.",
@@ -2593,6 +2621,36 @@ async function dispatchTool(
         referenceIntel: input.referenceIntel ? String(input.referenceIntel) : undefined,
       });
     }
+    case 'get_cohort_summary': {
+      const dp = (input.date_preset as 'today' | 'yesterday' | 'last_7d' | 'last_30d' | undefined) ?? 'last_7d';
+      const refresh = Boolean(input.refresh ?? false);
+      if (refresh) {
+        const r = await runCohortTick({ date_preset: dp });
+        const eventMap = r.event_map;
+        return {
+          ok: r.ok,
+          cio_available: r.cio_available,
+          error: r.error ?? null,
+          snapshot: r.snapshot,
+          event_map: eventMap,
+          rebill_tracking: eventMap.rebill
+            ? `tracking event "${eventMap.rebill}"`
+            : 'rebill event NOT found — use /cohorts set rebill <event_name> to configure',
+        };
+      }
+      const latest = await getLatestCohort('account');
+      const eventMap = await discoverCohortEventMap().catch(() => null);
+      return {
+        ok: true,
+        cio_available: CIO_CONFIGURED,
+        snapshot: latest,
+        event_map: eventMap,
+        rebill_tracking: eventMap?.rebill
+          ? `tracking event "${eventMap.rebill}"`
+          : 'rebill event NOT found — use /cohorts set rebill <event_name> to configure',
+        note: latest ? null : 'No cohort snapshot yet — use refresh:true or run /cohorts refresh',
+      };
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
   }
@@ -3203,6 +3261,114 @@ async function logAgentAction(
   }
 }
 
+// ---------- /cohorts — customer quality intelligence ----------
+
+async function handleCohortsCmd(chatId: number, args: string): Promise<void> {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  const sub = (parts[0] ?? '').toLowerCase();
+
+  if (sub === 'refresh' || sub === 'run') {
+    await bot.sendMessage(chatId, 'Pulling cohort data from Meta + CIO…');
+    try {
+      const r = await runCohortTick({ date_preset: 'last_7d', force_rediscover: sub === 'refresh' });
+      if (!r.ok) {
+        await bot.sendMessage(chatId, `Cohort pull failed: ${r.error ?? 'unknown error'}`);
+        return;
+      }
+      const text = r.snapshot
+        ? formatCohortForTelegram(r.snapshot, r.event_map)
+        : 'No snapshot data returned.';
+      await sendChunked(chatId, text);
+    } catch (err) {
+      await bot.sendMessage(chatId, `Cohort tick failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return;
+  }
+
+  if (sub === 'discover') {
+    await bot.sendMessage(chatId, 'Re-scanning CIO for event names…');
+    try {
+      const map = await discoverCohortEventMap(true);
+      const lines: string[] = [
+        'CIO event map updated:',
+        `  lead:    ${map.lead}`,
+        `  rebill:  ${map.rebill ?? '(not found)'}`,
+        `  intake:  ${map.intake_complete ?? '(not found)'}`,
+        `  approval: ${map.approval ?? '(not found)'}`,
+        `  refund:  ${map.refund ?? '(not found)'}`,
+        '',
+        'If rebill shows "(not found)", ask Rahul what the payment event is called in CIO.',
+        'Then set it with: /cohorts set rebill <event_name>',
+      ];
+      await sendChunked(chatId, lines.join('\n'));
+    } catch (err) {
+      await bot.sendMessage(chatId, `Discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return;
+  }
+
+  if (sub === 'set') {
+    const field = parts[1]?.toLowerCase() as 'lead' | 'rebill' | 'refund' | 'intake_complete' | 'approval' | undefined;
+    const eventName = parts.slice(2).join('_');
+    const validFields = ['lead', 'rebill', 'refund', 'intake_complete', 'approval'];
+    if (!field || !validFields.includes(field) || !eventName) {
+      await bot.sendMessage(chatId, `Usage: /cohorts set <lead|rebill|refund|intake_complete|approval> <event_name>\nExample: /cohorts set rebill Payment_completed`);
+      return;
+    }
+    try {
+      const updated = await setCohortEventOverride(field, eventName);
+      await bot.sendMessage(chatId, `Set ${field} → "${eventName}"\nRun /cohorts refresh to pull fresh data with the new mapping.`);
+      void updated;
+    } catch (err) {
+      await bot.sendMessage(chatId, `Set failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return;
+  }
+
+  if (sub === 'history') {
+    const limit = Math.min(parseInt(parts[1] ?? '14', 10) || 14, 30);
+    const rows = await listCohortHistory({ limit });
+    if (rows.length === 0) {
+      await bot.sendMessage(chatId, 'No cohort history. Run /cohorts refresh first.');
+      return;
+    }
+    const lines: string[] = [`Cohort history (${rows.length}):`, ''];
+    for (const r of rows) {
+      const rebillStr = r.rebill_count > 0
+        ? `rebills=${r.rebill_count}${r.rebill_rate_pct != null ? ` (${r.rebill_rate_pct.toFixed(0)}%)` : ''} CPB=${r.cpb != null ? `$${r.cpb.toFixed(0)}` : '?'}`
+        : 'rebills=0';
+      lines.push(`${r.cohort_date}  spend=$${r.spend.toFixed(0)}  leads=${r.lead_count}  CPL=${r.cpl != null ? `$${r.cpl.toFixed(0)}` : '?'}  ${rebillStr}`);
+    }
+    await sendChunked(chatId, lines.join('\n'));
+    return;
+  }
+
+  // Default: show latest snapshot
+  await bot.sendChatAction(chatId, 'typing');
+  const latest = await getLatestCohort('account');
+  const eventMap = await discoverCohortEventMap().catch(() => null);
+
+  if (!latest) {
+    await bot.sendMessage(chatId, [
+      'No cohort data yet.',
+      '',
+      'Run /cohorts refresh to pull a snapshot from Meta + CIO.',
+      'If the rebill event isn\'t found, ask Rahul the CIO event name and set it:',
+      '  /cohorts set rebill <event_name>',
+      '',
+      'Subcommands:',
+      '  /cohorts refresh — pull fresh data now',
+      '  /cohorts discover — re-scan CIO event names',
+      '  /cohorts set rebill <event_name>',
+      '  /cohorts history — show past snapshots',
+    ].join('\n'));
+    return;
+  }
+
+  const text = formatCohortForTelegram(latest, eventMap ?? undefined);
+  await sendChunked(chatId, text + '\n\nRun /cohorts refresh to update.');
+}
+
 // ---------- /tag — creative intelligence ----------
 
 async function handleTagCmd(chatId: number, args: string): Promise<void> {
@@ -3651,6 +3817,13 @@ bot.on('message', async (msg) => {
               '',
               'CIO upstream health:',
               '/cio — health check (events 24h/7d/30d, last seen, funnel state)',
+              '',
+              'Customer quality (CPB):',
+              '/cohorts — latest rebill rate, CPB, intake completion',
+              '/cohorts refresh — pull fresh snapshot from Meta + CIO now',
+              '/cohorts discover — re-scan CIO for event names',
+              '/cohorts set rebill <event_name> — configure the rebill event',
+              '/cohorts history — past snapshots',
               '',
               'Creative intelligence:',
               '/tag <ad> — auto-tag an ad (hook type, emotional angle, format, claim)',
@@ -4331,6 +4504,10 @@ bot.on('message', async (msg) => {
           }
           return;
         }
+        case 'cohorts':
+        case 'cohort':
+          await handleCohortsCmd(chatId, args);
+          return;
         case 'tag':
           await handleTagCmd(chatId, args);
           return;
