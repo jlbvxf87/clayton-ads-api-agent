@@ -65,7 +65,15 @@ import {
   requirePermission,
   describePermission,
   parseGrantArgs,
+  checkSpendTier,
 } from './permissions.js';
+import {
+  tagAndSaveAd,
+  getCreativeTag,
+  listCreativeTags,
+  formatTagSummary,
+  getCreativePerformanceByAngle,
+} from './creative.js';
 import {
   runMonitorTick,
   listOpenInbox,
@@ -787,6 +795,10 @@ async function handleBudgetCmd(chatId: number, userId: number | string, args: st
   }
 
   const deltaWeeklyCents = oldCents != null ? (newCents - oldCents) * 7 : newCents * 7;
+  const tierCheck = checkSpendTier(newDollars);
+  const tierLine = tierCheck.requires_approval
+    ? `\nSpend tier: ${tierCheck.tier.toUpperCase()} — ${tierCheck.approval_message}`
+    : '';
 
   setPending(chatId, userId, {
     kind: 'budget',
@@ -797,7 +809,7 @@ async function handleBudgetCmd(chatId: number, userId: number | string, args: st
   });
   await bot.sendMessage(
     chatId,
-    `Set daily budget?\n${campaign.name}\n${fmtMoney(oldCents)} -> ${fmtMoney(newCents)}\n7-day spend impact: ~${fmtMoney(Math.abs(deltaWeeklyCents))} ${deltaWeeklyCents >= 0 ? 'increase' : 'decrease'}\n\nReply confirm to proceed, anything else to cancel.`,
+    `Set daily budget?\n${campaign.name}\n${fmtMoney(oldCents)} -> ${fmtMoney(newCents)}\n7-day spend impact: ~${fmtMoney(Math.abs(deltaWeeklyCents))} ${deltaWeeklyCents >= 0 ? 'increase' : 'decrease'}${tierLine}\n\nReply confirm to proceed, anything else to cancel.`,
   );
 }
 
@@ -839,6 +851,11 @@ async function handleBoostCmd(chatId: number, userId: number | string, args: str
     return;
   }
 
+  const boostTierCheck = checkSpendTier(newCents / 100);
+  const boostTierLine = boostTierCheck.requires_approval
+    ? `\nSpend tier: ${boostTierCheck.tier.toUpperCase()} — ${boostTierCheck.approval_message}`
+    : '';
+
   setPending(chatId, userId, {
     kind: 'boost',
     campaignId: campaign.id,
@@ -849,7 +866,7 @@ async function handleBoostCmd(chatId: number, userId: number | string, args: str
   });
   await bot.sendMessage(
     chatId,
-    `Boost daily budget by ${pct > 0 ? '+' : ''}${pct}%?\n${campaign.name}\n${fmtMoney(oldCents)} -> ${fmtMoney(newCents)}\n\nReply confirm to proceed, anything else to cancel.`,
+    `Boost daily budget by ${pct > 0 ? '+' : ''}${pct}%?\n${campaign.name}\n${fmtMoney(oldCents)} -> ${fmtMoney(newCents)}${boostTierLine}\n\nReply confirm to proceed, anything else to cancel.`,
   );
 }
 
@@ -3186,6 +3203,64 @@ async function logAgentAction(
   }
 }
 
+// ---------- /tag — creative intelligence ----------
+
+async function handleTagCmd(chatId: number, args: string): Promise<void> {
+  const sub = args.trim().split(/\s+/)[0]?.toLowerCase();
+
+  if (sub === 'stats' || sub === 'performance') {
+    await bot.sendChatAction(chatId, 'typing');
+    const results = await getCreativePerformanceByAngle();
+    if (results.length === 0) {
+      await bot.sendMessage(chatId, 'No creative tags yet. Tag ads first with /tag <ad name>.');
+      return;
+    }
+    const lines: string[] = ['Creative tags by angle:', ''];
+    for (const r of results) {
+      lines.push(
+        `${r.angle.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}: ${r.ad_count} ad${r.ad_count === 1 ? '' : 's'}${r.avg_cpl != null ? `  avg CPL $${r.avg_cpl.toFixed(0)}` : ''}`,
+      );
+    }
+    await sendChunked(chatId, lines.join('\n'));
+    return;
+  }
+
+  if (!args.trim()) {
+    await bot.sendMessage(chatId, 'Usage: /tag <ad name or id>\n       /tag stats — breakdown by emotional angle');
+    return;
+  }
+
+  await bot.sendChatAction(chatId, 'typing');
+  const ad = await findAdByQuery(args);
+  if (!ad) {
+    await bot.sendMessage(chatId, `No ad matched "${args}".`);
+    return;
+  }
+
+  try {
+    const full = await getAd(ad.id);
+    const tag = await tagAndSaveAd({
+      id: full.id,
+      name: full.name,
+      title: full.creative?.title ?? undefined,
+      body: full.creative?.body ?? undefined,
+      campaign_id: (full as unknown as Record<string, unknown>).campaign_id as string | undefined,
+    });
+    const summary = formatTagSummary(tag);
+    const lines: string[] = [
+      `Tagged: ${full.name}`,
+      `  ${summary}`,
+      tag.hook_text ? `  Hook: "${tag.hook_text}"` : '',
+      tag.cta_language ? `  CTA: ${tag.cta_language}` : '',
+      tag.notes ? `  Notes: ${tag.notes}` : '',
+    ].filter(Boolean);
+    await sendChunked(chatId, lines.join('\n'));
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    await bot.sendMessage(chatId, `Tag failed: ${m}`);
+  }
+}
+
 // ---------- Free-form ask Claude (memory + tool-using agent loop) ----------
 
 // Maps Telegram user IDs / usernames to first-name display labels Clayton uses.
@@ -3576,6 +3651,10 @@ bot.on('message', async (msg) => {
               '',
               'CIO upstream health:',
               '/cio — health check (events 24h/7d/30d, last seen, funnel state)',
+              '',
+              'Creative intelligence:',
+              '/tag <ad> — auto-tag an ad (hook type, emotional angle, format, claim)',
+              '/tag stats — breakdown of tagged ads by emotional angle',
               '',
               'Market intelligence:',
               '/intel <topic> — deep multi-source landscape scan (news, Reddit, competitors, regulatory)',
@@ -4252,6 +4331,9 @@ bot.on('message', async (msg) => {
           }
           return;
         }
+        case 'tag':
+          await handleTagCmd(chatId, args);
+          return;
         case 'grant':
           await handleGrantCmd(chatId, userKey, args);
           return;

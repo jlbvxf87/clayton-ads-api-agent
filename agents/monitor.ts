@@ -36,7 +36,8 @@ export type SignalKind =
   | 'ctr_drop'
   | 'spend_velocity'
   | 'frequency_creep'
-  | 'funnel_step_silent';
+  | 'funnel_step_silent'
+  | 'creative_fatigue_warning';
 
 export type Severity = 'info' | 'notice' | 'alert' | 'critical';
 
@@ -237,7 +238,31 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
       }
     }
 
-    // 5. Funnel step silent — a known mid-funnel event fired in the last 7d but
+    // 5. Creative fatigue warning — frequency rising + CTR declining vs 7d baseline.
+    //    Fires early so variants can be queued before the creative dies.
+    if (todaySpend >= 20 && c.today && c.last7d) {
+      const todayFreq = c.today.frequency ? Number(c.today.frequency) : null;
+      const wkCtrVal = wkCtr;
+      const todayCtrVal = todayCtr;
+      if (todayFreq != null && todayFreq >= 2.5 && wkCtrVal != null && todayCtrVal != null) {
+        const ctrDecay = wkCtrVal > 0 ? (wkCtrVal - todayCtrVal) / wkCtrVal : 0;
+        if (ctrDecay >= 0.15) {
+          const daysLeft = Math.max(1, Math.round(4 - (todayFreq - 2.5) * 4));
+          out.push({
+            ...targetBase,
+            signal_kind: 'creative_fatigue_warning',
+            severity: todayFreq >= 3.5 ? 'alert' : 'notice',
+            current_value: todayFreq,
+            baseline_value: 2.5,
+            delta_pct: ctrDecay * 100,
+            message: `${c.campaign.name}: frequency ${todayFreq.toFixed(1)}, CTR down ${(ctrDecay * 100).toFixed(0)}% vs 7d avg — ~${daysLeft}d before fatigue. Queue creative variants now.`,
+            data: { frequency: todayFreq, ctr_today: todayCtrVal, ctr_7d: wkCtrVal, days_left: daysLeft },
+          });
+        }
+      }
+    }
+
+    // 6. Funnel step silent — a known mid-funnel event fired in the last 7d but
     //    has gone quiet today while the campaign is still spending. One signal
     //    per event type per campaign. Only fires after $15 spend today.
     if (todaySpend >= 15 && c.today && c.last7d) {

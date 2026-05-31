@@ -274,6 +274,12 @@ If nothing has materially changed, say so in ONE LINE: "No movement since last p
       : 'Customer.io: not configured.',
     '',
     `Per-campaign data:\n${JSON.stringify(summarizeRows(snapshot.rows), null, 2)}`,
+    '',
+    // CPB context — remind Claude to report cost per retained customer, not just CPL
+    `CPB NOTE: The primary KPI is CPB (cost per retained/billing customer), not CPL.`,
+    `CPL = Meta spend ÷ leads. CPB = Meta spend ÷ customers who rebill.`,
+    `If CIO rebill data is unavailable, report CPL but flag that CPB is the real number.`,
+    `A $120 CPL with 60% rebill rate beats a $80 CPL with 20% rebill rate.`,
   ].join('\n');
 
   const response = await anthropic.messages.create({

@@ -467,6 +467,59 @@ export function parseGrantArgs(raw: string): ParsedGrant | { error: string } {
   return { kind, scope, expires_at: expiresAt, notes };
 }
 
+// ---------- Spend tier gates ----------
+// At high spend levels, actions require explicit human approval regardless of
+// standing orders. This is the safety net for scaling to $100K/day.
+
+export type SpendTier = 'auto' | 'approval' | 'senior' | 'founder';
+
+export interface SpendTierResult {
+  tier: SpendTier;
+  daily_spend: number;
+  requires_approval: boolean;
+  approval_message: string | null;
+}
+
+/**
+ * Classify a campaign's daily spend level and return the required approval tier.
+ * auto     < $500/day   — agent can act without additional approval
+ * approval $500–$5K     — Pack or Josh must approve in chat
+ * senior   $5K–$25K     — senior operator approval required (Pack)
+ * founder  $25K+        — founder/CFO approval required
+ */
+export function checkSpendTier(dailySpendDollars: number): SpendTierResult {
+  if (dailySpendDollars >= 25_000) {
+    return {
+      tier: 'founder',
+      daily_spend: dailySpendDollars,
+      requires_approval: true,
+      approval_message: `Spend is $${dailySpendDollars.toLocaleString()}/day — founder/CFO approval required before any budget changes.`,
+    };
+  }
+  if (dailySpendDollars >= 5_000) {
+    return {
+      tier: 'senior',
+      daily_spend: dailySpendDollars,
+      requires_approval: true,
+      approval_message: `Spend is $${dailySpendDollars.toLocaleString()}/day — Pack (senior operator) must approve this action.`,
+    };
+  }
+  if (dailySpendDollars >= 500) {
+    return {
+      tier: 'approval',
+      daily_spend: dailySpendDollars,
+      requires_approval: true,
+      approval_message: `Spend is $${dailySpendDollars.toLocaleString()}/day — Pack or Josh must confirm before executing.`,
+    };
+  }
+  return {
+    tier: 'auto',
+    daily_spend: dailySpendDollars,
+    requires_approval: false,
+    approval_message: null,
+  };
+}
+
 function parseDollars(s: string): number | null {
   const m = s.replace(/^\$/, '');
   const n = Number(m);
