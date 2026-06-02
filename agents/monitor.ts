@@ -17,6 +17,7 @@ import {
   type PermissionKind,
 } from './permissions.js';
 import { runJudgmentOnSignal, formatJudgmentForTelegram } from './judgment.js';
+import { getCreativePerformanceByAngle } from './creative.js';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ACCOUNT_TZ = process.env.ACCOUNT_TZ ?? 'America/Los_Angeles';
@@ -248,15 +249,24 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
         const ctrDecay = wkCtrVal > 0 ? (wkCtrVal - todayCtrVal) / wkCtrVal : 0;
         if (ctrDecay >= 0.15) {
           const daysLeft = Math.max(1, Math.round(4 - (todayFreq - 2.5) * 4));
+          const fatigueSev: Severity = todayFreq >= 3.5 ? 'alert' : 'notice';
           out.push({
             ...targetBase,
             signal_kind: 'creative_fatigue_warning',
-            severity: todayFreq >= 3.5 ? 'alert' : 'notice',
+            severity: fatigueSev,
             current_value: todayFreq,
             baseline_value: 2.5,
             delta_pct: ctrDecay * 100,
             message: `${c.campaign.name}: frequency ${todayFreq.toFixed(1)}, CTR down ${(ctrDecay * 100).toFixed(0)}% vs 7d avg — ~${daysLeft}d before fatigue. Queue creative variants now.`,
             data: { frequency: todayFreq, ctr_today: todayCtrVal, ctr_7d: wkCtrVal, days_left: daysLeft },
+            // At alert (≥3.5 freq), standing order can auto-pause + trigger replacement brief
+            recommended_action: fatigueSev === 'alert'
+              ? {
+                  kind: 'pause' as PermissionKind,
+                  tool: 'pause_campaign',
+                  params: { campaign_id: c.campaign.id, campaign_name: c.campaign.name },
+                }
+              : undefined,
           });
         }
       }
@@ -462,6 +472,23 @@ async function notifyTelegram(text: string): Promise<void> {
 // spike costs. Reset on each runMonitorTick invocation.
 const JUDGMENT_PER_TICK_CAP = 3;
 
+async function buildCreativeSuggestion(): Promise<string | null> {
+  try {
+    const angles = await getCreativePerformanceByAngle();
+    if (angles.length === 0) return null;
+    const top = angles.slice(0, 3);
+    const angleList = top.map((a) => `${a.angle.replace(/_/g, ' ')} (${a.ad_count} ads tagged)`).join(', ');
+    return [
+      'Creative replacement brief:',
+      `Most-tested angles: ${angleList}`,
+      'Queue 2-3 fresh variants of your top-performing angle before re-activating.',
+      'Tag new ads with /tag after launch to track performance by angle.',
+    ].join('\n');
+  } catch {
+    return null;
+  }
+}
+
 async function surfaceItem(
   inboxId: number,
   sig: DetectedSignal,
@@ -469,9 +496,14 @@ async function surfaceItem(
   tickJudgmentBudget: { remaining: number },
 ): Promise<void> {
   if (autoActed.acted) {
-    const text = autoActed.emergency
+    let text = autoActed.emergency
       ? `[EMERGENCY PAUSED] ${sig.message}\nSpend exceeded $300 with 0 leads — paused automatically. Check pixel/funnel before re-activating.`
       : `${SEVERITY_PREFIX[sig.severity]} auto-resolved: ${sig.message}\nStanding order #${autoActed.permId} covered this — paused automatically.`;
+    // Phase 5: creative fatigue auto-pause appends a replacement brief
+    if (sig.signal_kind === 'creative_fatigue_warning') {
+      const suggestion = await buildCreativeSuggestion();
+      if (suggestion) text += `\n\n${suggestion}`;
+    }
     // Mark surfaced_at before sending so cooldown holds even if Telegram fails.
     const { error: markErr } = await supabase
       .from('agent_inbox')

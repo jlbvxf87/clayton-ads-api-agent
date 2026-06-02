@@ -69,7 +69,7 @@ create table if not exists creative_fatigue_predictions (
   days_to_fatigue   int,             -- estimated days remaining
   flagged_at        timestamptz not null default now(),
   resolved_at       timestamptz,
-  unique(ad_id, flagged_at::date)
+  unique(ad_id, flagged_at)
 );
 
 -- Indexes

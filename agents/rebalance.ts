@@ -11,6 +11,7 @@ import {
   type CampaignInsight,
 } from './meta.js';
 import { getCapiConfig, listEventMap, listRecentForwards } from './capi.js';
+import { loadActiveObservations, noteObservation } from './memory.js';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TELEGRAM_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN must be set for rebalance');
@@ -58,6 +59,7 @@ export interface CampaignMetrics {
   metric_value: number | null;
   adjusted_metric: number | null; // Bayesian-shrunk toward account avg
   portfolio_tier: PortfolioTier | null;
+  winner_consecutive_cycles: number;
   band: Band;
   reason: string;
   has_open_signal: boolean;
@@ -72,6 +74,7 @@ export interface ProposedChange {
   delta_pct: number;
   band: Band;
   metric_value: number | null;
+  winner_cycles?: number;
   reason: string;
   applied: boolean;
   apply_error?: string | null;
@@ -212,6 +215,42 @@ function classifyPortfolioTier(
   return 'testing';
 }
 
+// ---------- Winner cycle tracking ----------
+
+async function loadWinnerCycleMap(): Promise<Map<string, { id: number; cycles: number }>> {
+  const obs = await loadActiveObservations('rebalance:winner_cycles:');
+  const m = new Map<string, { id: number; cycles: number }>();
+  for (const o of obs) {
+    try {
+      const p = JSON.parse(o.observation) as { cycles: number };
+      const id = o.topic.replace('rebalance:winner_cycles:', '');
+      if (o.id != null) m.set(id, { id: o.id, cycles: p.cycles });
+    } catch {}
+  }
+  return m;
+}
+
+async function updateWinnerCycles(rows: CampaignMetrics[]): Promise<void> {
+  const cycleMap = await loadWinnerCycleMap();
+  for (const r of rows) {
+    const isWinner = r.portfolio_tier === 'winner';
+    const existing = cycleMap.get(r.campaign_id);
+    const newCycles = isWinner ? (existing?.cycles ?? 0) + 1 : 0;
+    r.winner_consecutive_cycles = newCycles;
+    if (isWinner || (existing && existing.cycles > 0)) {
+      const val = JSON.stringify({
+        cycles: newCycles,
+        campaign_name: r.campaign_name,
+        last_cycle: new Date().toISOString(),
+      });
+      await noteObservation(`rebalance:winner_cycles:${r.campaign_id}`, val, {
+        confidence: 'high',
+        supersedes: existing?.id,
+      });
+    }
+  }
+}
+
 // ---------- Banding ----------
 
 interface AssembledMetrics {
@@ -269,6 +308,7 @@ async function assembleMetrics(): Promise<AssembledMetrics> {
       metric_value: metricValue,
       adjusted_metric: null, // filled in after account avg is known
       portfolio_tier: null,  // filled in after account avg is known
+      winner_consecutive_cycles: 0,
       band,
       reason: reasonStr,
       has_open_signal: hasOpenSignal,
@@ -320,6 +360,7 @@ async function assembleMetrics(): Promise<AssembledMetrics> {
     }
   }
 
+  await updateWinnerCycles(rows);
   return { rows, account_avg, metric, metric_reason: reason };
 }
 
@@ -343,7 +384,9 @@ function buildChanges(rows: CampaignMetrics[]): ProposedChange[] {
     const tier = r.portfolio_tier;
 
     if (tier === 'winner') {
-      const { newCents, effectivePct } = clampDelta(current, WINNER_BUMP_PCT);
+      // Confirmed winners (2+ cycles) earn a larger +50% bump vs first-cycle +30%
+      const bumpPct = r.winner_consecutive_cycles >= 2 ? 50 : WINNER_BUMP_PCT;
+      const { newCents, effectivePct } = clampDelta(current, bumpPct);
       if (newCents === current) continue;
       out.push({
         campaign_id: r.campaign_id,
@@ -354,6 +397,7 @@ function buildChanges(rows: CampaignMetrics[]): ProposedChange[] {
         delta_pct: effectivePct,
         band: r.band,
         metric_value: r.metric_value,
+        winner_cycles: r.winner_consecutive_cycles,
         reason: r.reason,
         applied: false,
       });
@@ -599,7 +643,8 @@ export function formatPlanForTelegram(plan: RebalancePlan): string {
   if (winners.length > 0) {
     lines.push('WINNERS — scaling up (Bayesian-confirmed):');
     for (const c of winners) {
-      lines.push(`  ↑ ${c.campaign_name}: ${fmt$(c.current_daily_cents)} → ${fmt$(c.proposed_daily_cents)} (+${c.delta_pct.toFixed(0)}%)`);
+      const star = c.winner_cycles && c.winner_cycles >= 2 ? ` ⭐×${c.winner_cycles}` : '';
+      lines.push(`  ↑ ${c.campaign_name}${star}: ${fmt$(c.current_daily_cents)} → ${fmt$(c.proposed_daily_cents)} (+${c.delta_pct.toFixed(0)}%)`);
       lines.push(`    ${c.reason}`);
     }
     lines.push('');
