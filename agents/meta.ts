@@ -36,6 +36,44 @@ const meta: AxiosInstance = axios.create({
   timeout: 30_000,
 });
 
+// Unwrap Meta error bodies so callers (and the Telegram surface) see the real
+// message + code instead of axios's useless "Request failed with status code 400".
+export class MetaApiError extends Error {
+  code?: number;
+  subcode?: number;
+  fbtrace_id?: string;
+  status?: number;
+  constructor(
+    message: string,
+    extras: { code?: number; subcode?: number; fbtrace_id?: string; status?: number } = {},
+  ) {
+    super(message);
+    this.name = 'MetaApiError';
+    this.code = extras.code;
+    this.subcode = extras.subcode;
+    this.fbtrace_id = extras.fbtrace_id;
+    this.status = extras.status;
+  }
+}
+
+meta.interceptors.response.use(
+  (resp) => resp,
+  (err) => {
+    const body = err?.response?.data?.error;
+    if (body) {
+      const codePart = body.code != null ? `#${body.code}${body.error_subcode ? `.${body.error_subcode}` : ''}` : '';
+      const msg = `Meta ${codePart}: ${body.message ?? 'unknown error'}${body.error_user_msg ? ` — ${body.error_user_msg}` : ''}`;
+      throw new MetaApiError(msg, {
+        code: body.code,
+        subcode: body.error_subcode,
+        fbtrace_id: body.fbtrace_id,
+        status: err.response?.status,
+      });
+    }
+    throw err;
+  },
+);
+
 export interface Campaign {
   id: string;
   name: string;
@@ -957,7 +995,7 @@ export async function createLookalikeAudience(args: {
   source_audience_id: string;
   ratio: number;          // 0.01 (1%) to 0.20 (20%); ratio is decimal
   country: string;        // e.g. 'US'
-}): Promise<{ id: string }> {
+}): Promise<{ id: string; reused?: boolean; source_name?: string }> {
   if (args.ratio < 0.01 || args.ratio > 0.2) {
     throw new Error('ratio must be between 0.01 (1%) and 0.20 (20%)');
   }
@@ -966,16 +1004,55 @@ export async function createLookalikeAudience(args: {
     ratio: args.ratio,
     country: args.country,
   };
-  const { data } = await meta.post(`/${AD_ACCOUNT}/customaudiences`, null, {
-    params: {
-      name: args.name,
-      subtype: 'LOOKALIKE',
-      origin_audience_id: args.source_audience_id,
-      lookalike_spec: JSON.stringify(lookalikeSpec),
-    },
-  });
-  if (!data?.id) throw new Error('Lookalike creation returned no id');
-  return { id: data.id as string };
+  try {
+    const { data } = await meta.post(`/${AD_ACCOUNT}/customaudiences`, null, {
+      params: {
+        name: args.name,
+        subtype: 'LOOKALIKE',
+        origin_audience_id: args.source_audience_id,
+        lookalike_spec: JSON.stringify(lookalikeSpec),
+      },
+    });
+    if (!data?.id) throw new Error('Lookalike creation returned no id');
+    return { id: data.id as string };
+  } catch (err) {
+    // #2654 = "Can't Create a Duplicate Lookalike" — Meta rejects (source, country, ratio)
+    // combos that already exist. Find the duplicate and return its ID instead of failing.
+    if (err instanceof MetaApiError && err.code === 2654) {
+      const all = await listCustomAudiences();
+      const existing = all.find(
+        (a) => a.subtype === 'LOOKALIKE' && nameTargetsSeed(a.name, args.source_audience_id, args.ratio, args.country, all),
+      );
+      if (existing) {
+        return { id: existing.id, reused: true, source_name: existing.name };
+      }
+      // Couldn't pinpoint the duplicate — re-throw with a helpful pointer.
+      throw new MetaApiError(
+        `A ${(args.ratio * 100).toFixed(0)}% ${args.country} lookalike off source ${args.source_audience_id} already exists. List custom audiences and reuse the existing one.`,
+        { code: 2654 },
+      );
+    }
+    throw err;
+  }
+}
+
+// Heuristic: match a lookalike to a (source_id, ratio, country) by name pattern.
+// Meta's audience names follow "Lookalike (US, 1%) - <source name>" or similar.
+function nameTargetsSeed(
+  lalName: string,
+  sourceId: string,
+  ratio: number,
+  country: string,
+  all: CustomAudience[],
+): boolean {
+  const sourceName = all.find((a) => a.id === sourceId)?.name;
+  if (!sourceName) return false;
+  if (!lalName.includes(sourceName)) return false;
+  if (!new RegExp(`\\b${country}\\b`, 'i').test(lalName)) return false;
+  const pct = (ratio * 100).toFixed(0);
+  // Match the single-ratio form "(US, 1%)" — closing paren immediately after
+  // the percent — so we don't false-positive on the range form "(US, 1% to 2%)".
+  return new RegExp(`(?:^|[^0-9])${pct}%\\)`).test(lalName);
 }
 
 export async function deleteCustomAudience(audienceId: string): Promise<{ success: boolean; id: string }> {

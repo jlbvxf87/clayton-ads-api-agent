@@ -1429,7 +1429,7 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
   },
   {
     name: 'create_lookalike_audience',
-    description: "Create a Lookalike audience from an existing source audience. ratio is 0.01 (1%) to 0.20 (20%). Higher ratio = larger but lower-quality audience. Confirm with user before creating.",
+    description: "Create a Lookalike audience from an existing source audience. ratio is 0.01 (1%) to 0.20 (20%). Higher ratio = larger but lower-quality audience. Confirm with user before creating. If a lookalike with the same (source, country, ratio) already exists in the account, this tool will return that existing audience instead of failing — the response will include `reused: true` and `source_name`. Use that existing audience_id when building ad sets; do NOT try to re-create.",
     input_schema: {
       type: 'object',
       properties: {
