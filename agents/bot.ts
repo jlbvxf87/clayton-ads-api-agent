@@ -36,6 +36,7 @@ import {
   updateAdSetTargeting,
   listCustomAudiences,
   createLookalikeAudience,
+  deleteCustomAudience,
   AD_ACCOUNTS,
   type Campaign,
   type AdSet,
@@ -1441,6 +1442,17 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'delete_custom_audience',
+    description: "Permanently delete a custom or lookalike audience by ID. Irreversible — Meta cannot restore it. Use to clean up failed lookalikes (operation_status describes 'delete this audience and try creating it again') or test audiences. Always confirm with user first; surface the audience name in the confirmation prompt.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        audience_id: { type: 'string', description: 'The Meta audience ID, e.g. 120248546155450153' },
+      },
+      required: ['audience_id'],
+    },
+  },
+  {
     name: 'cio_list_segments',
     description: "List all Customer.io segments (name, id, description, customer count). Use to find segment IDs for follow-up queries or to map a Meta audience to a CIO segment.",
     input_schema: { type: 'object', properties: {}, required: [] },
@@ -2150,6 +2162,14 @@ async function dispatchTool(
       });
       await logAgentAction(chatId, 'create_lookalike_audience', result.id, input.name as string, null, input);
       return result;
+    }
+    case 'delete_custom_audience': {
+      const audienceId = input.audience_id as string;
+      // Capture name first so the audit trail is meaningful after deletion.
+      const aud = (await listCustomAudiences()).find((a) => a.id === audienceId);
+      const result = await deleteCustomAudience(audienceId);
+      await logAgentAction(chatId, 'delete_custom_audience', audienceId, aud?.name ?? null, aud ?? null, result);
+      return { ...result, deleted_name: aud?.name ?? null };
     }
     case 'cio_list_segments': {
       const segs = await cioListSegments();
@@ -3100,6 +3120,11 @@ const WRITE_TOOL_SPECS: Record<string, WriteToolSpec> = {
     paramsFor: () => ({}),
     targetLabel: (i) => `create lookalike audience "${i.name}"`,
   },
+  delete_custom_audience: {
+    permKind: () => 'audience',
+    paramsFor: () => ({}),
+    targetLabel: (i) => `delete audience ${i.audience_id}`,
+  },
   cio_send_event: {
     permKind: () => 'cio_event',
     paramsFor: () => ({}),
@@ -3269,6 +3294,82 @@ async function logAgentAction(
   } catch (err) {
     console.warn('logAgentAction failed:', err);
   }
+}
+
+// ---------- /audiences — Meta custom + lookalike audiences ----------
+
+async function handleAudiencesCmd(
+  chatId: number,
+  userId: number | string,
+  args: string,
+): Promise<void> {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  const sub = (parts[0] ?? '').toLowerCase();
+
+  if (sub === 'list' || sub === '') {
+    const aud = await listCustomAudiences();
+    if (aud.length === 0) {
+      await bot.sendMessage(chatId, 'No custom audiences in this ad account.');
+      return;
+    }
+    // Group by subtype for readability
+    const groups = new Map<string, typeof aud>();
+    for (const a of aud) {
+      const key = a.subtype ?? 'OTHER';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(a);
+    }
+    const lines: string[] = [`Custom audiences (${aud.length} total):`];
+    for (const [subtype, items] of [...groups.entries()].sort()) {
+      lines.push(`\n${subtype} (${items.length}):`);
+      for (const a of items) {
+        const lo = a.approximate_count_lower_bound;
+        const hi = a.approximate_count_upper_bound;
+        const sized = lo != null && lo >= 0;
+        const size = sized ? (lo === hi ? `${lo}` : `${lo}–${hi}`) : 'pending';
+        const status = a.operation_status?.description ?? '';
+        const failed = /couldn't create|delete this audience/i.test(status) ? '  ⚠ FAILED' : '';
+        lines.push(`  ${a.id}  ${a.name}  (${size})${failed}`);
+      }
+    }
+    lines.push('\n/audiences delete <id> — remove a failed or stale audience');
+    await sendChunked(chatId, lines.join('\n'));
+    return;
+  }
+
+  if (sub === 'delete' && parts[1]) {
+    const audienceId = parts[1];
+    const aud = (await listCustomAudiences()).find((a) => a.id === audienceId);
+    if (!aud) {
+      await bot.sendMessage(chatId, `No audience found with ID ${audienceId}. Run /audiences list to see all IDs.`);
+      return;
+    }
+    setPending(chatId, userId, {
+      kind: 'tool_action',
+      toolName: 'delete_custom_audience',
+      input: { audience_id: audienceId },
+      permKind: 'audience',
+      targetLabel: `delete audience "${aud.name}"`,
+    });
+    const status = aud.operation_status?.description ?? 'OK';
+    await bot.sendMessage(
+      chatId,
+      `Delete this audience? **IRREVERSIBLE** — Meta cannot restore it.\n\n` +
+        `Name: ${aud.name}\nID: ${aud.id}\nSubtype: ${aud.subtype}\nMeta status: ${status}\n\n` +
+        `Reply confirm / yes / fire to proceed, or anything else to cancel.`,
+    );
+    return;
+  }
+
+  const help = [
+    '/audiences — Meta custom + lookalike audiences',
+    '',
+    '  /audiences list          — show all audiences grouped by type',
+    '  /audiences delete <id>   — permanently delete one (irreversible, needs confirmation)',
+    '',
+    'Use delete to clean up failed lookalikes (Meta status says "couldn\'t create… delete and try again").',
+  ].join('\n');
+  await bot.sendMessage(chatId, help);
 }
 
 // ---------- /rules — autonomous scaling rules ----------
@@ -3920,6 +4021,10 @@ bot.on('message', async (msg) => {
               '/rules — list active rules and trigger history',
               '/rules eval — run all rules now against live account',
               '/rules auto <id> — promote rule to auto-execute',
+              '',
+              'Audiences:',
+              '/audiences — list all custom + lookalike audiences grouped by type',
+              '/audiences delete <id> — permanently delete one (irreversible)',
               '',
               'Market intelligence:',
               '/intel <topic> — deep multi-source landscape scan (news, Reddit, competitors, regulatory)',
@@ -4605,6 +4710,10 @@ bot.on('message', async (msg) => {
           return;
         case 'rules':
           await handleRulesCmd(chatId, args);
+          return;
+        case 'audiences':
+        case 'audience':
+          await handleAudiencesCmd(chatId, userKey, args);
           return;
         case 'grant':
           await handleGrantCmd(chatId, userKey, args);

@@ -978,6 +978,11 @@ export async function createLookalikeAudience(args: {
   return { id: data.id as string };
 }
 
+export async function deleteCustomAudience(audienceId: string): Promise<{ success: boolean; id: string }> {
+  const { data } = await meta.delete(`/${audienceId}`);
+  return { success: Boolean((data as { success?: boolean })?.success), id: audienceId };
+}
+
 // ---------- Pixel / Events Manager ----------
 
 export interface AdsPixel {
