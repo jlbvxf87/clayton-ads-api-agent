@@ -2124,12 +2124,19 @@ async function dispatchTool(
     }
     case 'list_custom_audiences': {
       const aud = await listCustomAudiences();
-      return aud.map((a) => ({
-        id: a.id,
-        name: a.name,
-        approximate_count: a.approximate_count ?? null,
-        subtype: a.subtype ?? null,
-      }));
+      return aud.map((a) => {
+        const lo = a.approximate_count_lower_bound;
+        const hi = a.approximate_count_upper_bound;
+        // -1 (or missing) means Meta hasn't sized it yet — common for lookalikes.
+        const sized = lo != null && lo >= 0;
+        return {
+          id: a.id,
+          name: a.name,
+          subtype: a.subtype ?? null,
+          approximate_count: sized ? (lo === hi ? lo : `${lo}–${hi}`) : null,
+          status: a.operation_status?.description ?? null,
+        };
+      });
     }
     case 'create_lookalike_audience': {
       const result = await createLookalikeAudience({

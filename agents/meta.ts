@@ -933,15 +933,21 @@ export interface CustomAudience {
   id: string;
   name: string;
   description?: string;
-  approximate_count?: number;
+  // Meta deprecated `approximate_count` — it now returns lower/upper bounds.
+  // A value of -1 means the size is still being calculated or is unavailable
+  // (typical for LOOKALIKE audiences).
+  approximate_count_lower_bound?: number;
+  approximate_count_upper_bound?: number;
   subtype?: string;
   retention_days?: number;
+  operation_status?: { code?: number; description?: string };
 }
 
 export async function listCustomAudiences(accountId?: string): Promise<CustomAudience[]> {
   const acct = resolveAdAccount(accountId);
   return paginated<CustomAudience>(`/${acct}/customaudiences`, {
-    fields: 'id,name,description,approximate_count,subtype,retention_days',
+    fields:
+      'id,name,description,approximate_count_lower_bound,approximate_count_upper_bound,subtype,retention_days,operation_status',
     limit: '100',
   });
 }
