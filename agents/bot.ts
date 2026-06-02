@@ -320,34 +320,48 @@ type PendingAction =
 const PENDING_TTL_MS = 5 * 60 * 1000;
 // Key: `${chatId}:${userId}` — scopes confirmations to the user who started the
 // action, so in group chats one person can't confirm another person's pending write.
-const pending = new Map<string, { action: PendingAction; expiresAt: number }>();
+// Value is now a QUEUE so multiple tool_actions in one LLM turn batch together
+// instead of overwriting each other (previously: only the last one survived).
+const pending = new Map<string, { actions: PendingAction[]; expiresAt: number }>();
 
 function pendingKey(chatId: number, userId: number | string): string {
   return `${chatId}:${userId}`;
 }
 
 function setPending(chatId: number, userId: number | string, action: PendingAction): void {
-  pending.set(pendingKey(chatId, userId), { action, expiresAt: Date.now() + PENDING_TTL_MS });
+  const k = pendingKey(chatId, userId);
+  const existing = pending.get(k);
+  const expiresAt = Date.now() + PENDING_TTL_MS;
+  if (existing && existing.expiresAt > Date.now()) {
+    existing.actions.push(action);
+    existing.expiresAt = expiresAt;
+  } else {
+    pending.set(k, { actions: [action], expiresAt });
+  }
 }
 
-function takePending(chatId: number, userId: number | string): PendingAction | null {
+function takePending(chatId: number, userId: number | string): PendingAction[] {
   const k = pendingKey(chatId, userId);
   const entry = pending.get(k);
-  if (!entry) return null;
+  if (!entry) return [];
   pending.delete(k);
-  if (Date.now() > entry.expiresAt) return null;
-  return entry.action;
+  if (Date.now() > entry.expiresAt) return [];
+  return entry.actions;
 }
 
-function peekPending(chatId: number, userId: number | string): PendingAction | null {
+function peekPending(chatId: number, userId: number | string): PendingAction[] {
   const k = pendingKey(chatId, userId);
   const entry = pending.get(k);
-  if (!entry) return null;
+  if (!entry) return [];
   if (Date.now() > entry.expiresAt) {
     pending.delete(k);
-    return null;
+    return [];
   }
-  return entry.action;
+  return [...entry.actions];
+}
+
+function pendingSize(chatId: number, userId: number | string): number {
+  return peekPending(chatId, userId).length;
 }
 
 // ---------- Guardrail helpers ----------
@@ -3237,7 +3251,9 @@ async function dispatchToolGuarded(
     return result;
   }
 
-  // Denied — stage a pending tool_action so user can confirm one-shot or grant.
+  // Denied — stage a pending tool_action. ONE consolidated prompt for the whole
+  // queue is sent at end of the agentic turn (see askClaude tail) — no per-action
+  // Telegram message here, so a multi-tool turn doesn't spam the chat.
   if (userKey) {
     setPending(chatId, userKey, {
       kind: 'tool_action',
@@ -3247,27 +3263,14 @@ async function dispatchToolGuarded(
       targetLabel,
     });
   }
-  // Owner-facing prompt — plain English, no internal jargon. The system
-  // surfaces ONE clear "Reply YES" prompt. The agent must not generate
-  // additional follow-up text after this fires (see AGENT.md "user-facing
-  // language" rule and the next_step instruction below).
-  await bot.sendMessage(
-    chatId,
-    `About to ${targetLabel}.\n\nReply YES to confirm, or anything else to cancel.`,
-  );
   void sender; // reserved for future audit trail enrichment
   return {
     permission_required: true,
     kind: permKind,
     target: targetLabel,
     pending_staged: Boolean(userKey),
-    // Internal cue only. The user has already been shown a plain-English
-    // confirmation prompt by the system; the agent must NOT emit any
-    // additional text — no commentary, no jargon, no "wrapper" or
-    // "standing order" or "permission gate" language. Output an empty text
-    // block on the next assistant turn and wait for the user's reply.
     next_step: userKey
-      ? "STOP. The system has already shown the user a 'Reply YES to confirm' prompt. Emit NO text in your final response — just acknowledge silently. Do NOT mention wrappers, gates, permissions, standing orders, or rephrase what the prompt said. Wait for the user's reply."
+      ? "STOP. This action has been queued; the system will show ONE consolidated 'Reply YES' prompt at end of turn covering ALL queued actions. Emit NO text in your final response — do not mention permissions/gates/standing orders or repeat what was queued. Continue calling any remaining tools for this request, then end silently."
       : 'Ask the user to confirm by re-issuing as a slash command.',
   };
 }
@@ -3787,9 +3790,33 @@ async function askClaude(
     turnImages.delete(chatId);
   }
 
+  // 5. Consolidated permission prompt: if the agentic loop queued one or more
+  // tool_actions awaiting confirmation, show a SINGLE summary prompt so the
+  // user can approve the whole batch with one YES instead of N.
+  const queued = guardUserKey ? peekPending(chatId, guardUserKey) : [];
+  const toolQueue = queued.filter((a): a is Extract<PendingAction, { kind: 'tool_action' }> => a.kind === 'tool_action');
+  if (toolQueue.length > 0) {
+    const lines: string[] = [];
+    if (toolQueue.length === 1) {
+      lines.push(`About to ${toolQueue[0].targetLabel}.`);
+      lines.push('');
+      lines.push('Reply YES to confirm, or anything else to cancel.');
+    } else {
+      lines.push(`About to do ${toolQueue.length} actions:`);
+      lines.push('');
+      toolQueue.forEach((a, i) => lines.push(`  ${i + 1}. ${a.targetLabel}`));
+      lines.push('');
+      lines.push(`Reply YES to do all ${toolQueue.length}, or anything else to cancel all.`);
+    }
+    const prompt = lines.join('\n');
+    // Suppress the LLM's text if it was an empty placeholder — the prompt IS the message.
+    if (!assistantText || assistantText === '[no response]') assistantText = prompt;
+    else assistantText = `${assistantText}\n\n${prompt}`;
+  }
+
   if (!assistantText) assistantText = '[no response]';
 
-  // 5. Persist the assistant reply so future turns can see it.
+  // 6. Persist the assistant reply so future turns can see it.
   await recordMessage(chatId, 'assistant', assistantText);
 
   await sendChunked(chatId, assistantText);
@@ -3876,22 +3903,49 @@ bot.on('message', async (msg) => {
   }
 
   try {
-    // If a pending action is waiting and the user did NOT start a new slash command,
-    // try to interpret their reply as confirm/cancel.
-    if (peekPending(chatId, userKey) && !text.startsWith('/')) {
+    // If pending actions are waiting and the user did NOT start a new slash command,
+    // try to interpret their reply as confirm/cancel. A single YES now drains the
+    // entire batch sequentially.
+    if (pendingSize(chatId, userKey) > 0 && !text.startsWith('/')) {
       const verdict = classifyReply(text);
       if (verdict === 'confirm') {
-        const action = takePending(chatId, userKey);
-        if (action)
-          await executePending(chatId, action, handle, text, {
+        const actions = takePending(chatId, userKey);
+        if (actions.length === 1) {
+          await executePending(chatId, actions[0], handle, text, {
             userId: senderId,
             username: senderUsername,
           });
+        } else if (actions.length > 1) {
+          await bot.sendMessage(chatId, `Running ${actions.length} actions…`);
+          let ok = 0;
+          let fail = 0;
+          const failures: string[] = [];
+          for (const a of actions) {
+            try {
+              await executePending(chatId, a, handle, text, {
+                userId: senderId,
+                username: senderUsername,
+              });
+              ok++;
+            } catch (err) {
+              fail++;
+              const m = err instanceof Error ? err.message : String(err);
+              const label = a.kind === 'tool_action' ? a.targetLabel : a.kind;
+              failures.push(`  ✗ ${label}: ${m}`);
+            }
+          }
+          const summary =
+            fail === 0
+              ? `✓ All ${ok} actions complete.`
+              : `Done: ${ok} succeeded, ${fail} failed.\n${failures.join('\n')}`;
+          await bot.sendMessage(chatId, summary);
+        }
         return;
       }
       if (verdict === 'cancel') {
+        const n = pendingSize(chatId, userKey);
         takePending(chatId, userKey);
-        await bot.sendMessage(chatId, 'Cancelled.');
+        await bot.sendMessage(chatId, n > 1 ? `Cancelled all ${n} pending actions.` : 'Cancelled.');
         return;
       }
       // unclear → fall through to Claude
