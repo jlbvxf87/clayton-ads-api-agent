@@ -976,14 +976,12 @@ async function executePending(
   userHandle: string,
   originalMessage: string,
   sender?: { userId?: number | string | null; username?: string | null },
-): Promise<void> {
+): Promise<{ ok: boolean; error?: string }> {
   const overrideRequested = /\bOVERRIDE\b/.test(originalMessage);
   if (isTiredFingersWindow() && !overrideRequested) {
-    await bot.sendMessage(
-      chatId,
-      'Refused: 02:00–06:00 PT is the no-write window (tired-fingers protection). Add the word OVERRIDE to your reply to bypass.',
-    );
-    return;
+    const msg = 'Refused: 02:00–06:00 PT is the no-write window (tired-fingers protection). Add the word OVERRIDE to your reply to bypass.';
+    await bot.sendMessage(chatId, msg);
+    return { ok: false, error: 'tired-fingers window' };
   }
 
   if (action.kind === 'tool_action') {
@@ -994,11 +992,12 @@ async function executePending(
           ? JSON.stringify(result).slice(0, 600)
           : String(result);
       await bot.sendMessage(chatId, `Done — ${action.targetLabel}.\n${summary}`);
+      return { ok: true };
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       await bot.sendMessage(chatId, `Failed to ${action.targetLabel}: ${m}`);
+      return { ok: false, error: m };
     }
-    return;
   }
 
   if (action.kind === 'grant') {
@@ -1013,22 +1012,24 @@ async function executePending(
         notes: action.notes,
       });
       await bot.sendMessage(chatId, `Saved. You won't be asked again for: ${describePermission(p)}`);
+      return { ok: true };
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       await bot.sendMessage(chatId, `Failed to grant: ${m}`);
+      return { ok: false, error: m };
     }
-    return;
   }
 
   if (action.kind === 'revoke') {
     try {
       await revokePermission(action.permissionId, action.reason);
       await bot.sendMessage(chatId, `Revoked permission #${action.permissionId}.`);
+      return { ok: true };
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       await bot.sendMessage(chatId, `Failed to revoke: ${m}`);
+      return { ok: false, error: m };
     }
-    return;
   }
 
   const before = await getCampaign(action.campaignId).catch(() => null);
@@ -1049,11 +1050,9 @@ async function executePending(
     .select()
     .single();
   if (auditErr || !audit) {
-    await bot.sendMessage(
-      chatId,
-      `Audit log failed (${auditErr?.message ?? 'no row returned'}). Aborting write per guardrail #7.`,
-    );
-    return;
+    const msg = `Audit log failed (${auditErr?.message ?? 'no row returned'}). Aborting write per guardrail #7.`;
+    await bot.sendMessage(chatId, msg);
+    return { ok: false, error: msg };
   }
 
   try {
@@ -1084,6 +1083,7 @@ async function executePending(
             ? `Set ${action.campaignName} daily budget to ${fmtMoney(action.newDailyBudgetCents)}.`
             : `Boosted ${action.campaignName} by ${action.percent}%: ${fmtMoney(action.oldDailyBudgetCents)} -> ${fmtMoney(action.newDailyBudgetCents)}.`;
     await bot.sendMessage(chatId, summary);
+    return { ok: true };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     const fbBody = (err as { response?: { data?: unknown } })?.response?.data;
@@ -1097,6 +1097,7 @@ async function executePending(
       .eq('id', audit.id);
     const detail = fbBody ? `\n${JSON.stringify(fbBody).slice(0, 800)}` : '';
     await bot.sendMessage(chatId, `Meta API error:\n${errMsg}${detail}`);
+    return { ok: false, error: errMsg };
   }
 }
 
@@ -1319,7 +1320,7 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
   },
   {
     name: 'create_campaign',
-    description: "Create a new campaign — always saved as PAUSED. Use when the user explicitly says 'create' or 'spin up' a campaign. Confirm campaign details with the user before calling. Daily budget hard-capped at $500 per single creation; floor $5.",
+    description: "Create a new campaign — always saved as PAUSED. Use when the user explicitly says 'create' or 'spin up' a campaign. Confirm campaign details with the user before calling. Daily budget hard-capped at $500 per single creation; floor $5. IMPORTANT: bid_strategy defaults to LOWEST_COST_WITHOUT_CAP. Only override to LOWEST_COST_WITH_BID_CAP or COST_CAP if the user explicitly wants a manual bid cap — those modes REQUIRE every child ad set to provide a bid_amount field, and if you forget, every ad set creation will 400 with 'Bid amount required'. For standard CBO + 'let Meta optimize', leave bid_strategy unset.",
     input_schema: {
       type: 'object',
       properties: {
@@ -1329,6 +1330,10 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
           description: "Campaign objective: 'OUTCOME_LEADS','OUTCOME_SALES','OUTCOME_TRAFFIC','OUTCOME_AWARENESS','OUTCOME_ENGAGEMENT','OUTCOME_APP_PROMOTION'",
         },
         daily_budget_dollars: { type: 'number', description: 'Optional CBO daily budget at the campaign level' },
+        bid_strategy: {
+          type: 'string',
+          description: "Optional. Default 'LOWEST_COST_WITHOUT_CAP' (recommended). Set to 'LOWEST_COST_WITH_BID_CAP' or 'COST_CAP' ONLY if user explicitly wants a manual cap (then every ad set must pass bid_amount).",
+        },
         special_ad_categories: { type: 'array', items: { type: 'string' }, description: "Special ad category codes if applicable, e.g. ['HOUSING','EMPLOYMENT','CREDIT','ISSUES_ELECTIONS_POLITICS']" },
       },
       required: ['name', 'objective'],
@@ -2063,6 +2068,7 @@ async function dispatchTool(
         objective: input.objective as string,
         special_ad_categories: input.special_ad_categories as string[] | undefined,
         daily_budget_cents: dollars != null ? Math.round(dollars * 100) : undefined,
+        bid_strategy: input.bid_strategy as 'LOWEST_COST_WITHOUT_CAP' | 'LOWEST_COST_WITH_BID_CAP' | 'COST_CAP' | undefined,
       });
       await logAgentAction(chatId, 'create_campaign', result.id, input.name as string, null, result.payload);
       return result;
@@ -3921,23 +3927,30 @@ bot.on('message', async (msg) => {
           let fail = 0;
           const failures: string[] = [];
           for (const a of actions) {
+            const label = a.kind === 'tool_action' ? a.targetLabel : a.kind;
             try {
-              await executePending(chatId, a, handle, text, {
+              const result = await executePending(chatId, a, handle, text, {
                 userId: senderId,
                 username: senderUsername,
               });
-              ok++;
+              if (result.ok) {
+                ok++;
+              } else {
+                fail++;
+                failures.push(`  ✗ ${label}: ${result.error ?? 'unknown error'}`);
+              }
             } catch (err) {
               fail++;
               const m = err instanceof Error ? err.message : String(err);
-              const label = a.kind === 'tool_action' ? a.targetLabel : a.kind;
               failures.push(`  ✗ ${label}: ${m}`);
             }
           }
           const summary =
             fail === 0
               ? `✓ All ${ok} actions complete.`
-              : `Done: ${ok} succeeded, ${fail} failed.\n${failures.join('\n')}`;
+              : ok === 0
+                ? `✗ All ${fail} actions failed.\n${failures.join('\n')}`
+                : `Done: ${ok} succeeded, ${fail} failed.\n${failures.join('\n')}`;
           await bot.sendMessage(chatId, summary);
         }
         return;

@@ -859,6 +859,11 @@ interface CreateCampaignArgs {
   special_ad_categories?: string[];
   daily_budget_cents?: number;     // optional CBO daily budget at the campaign level
   buying_type?: 'AUCTION' | 'RESERVED';
+  // Default LOWEST_COST_WITHOUT_CAP. The account-level default on this ad
+  // account is LOWEST_COST_WITH_BID_CAP, which propagates to every campaign
+  // unless explicitly overridden — and that mode REQUIRES every child ad set
+  // to pass bid_amount or creation 400s. Force the no-cap default here.
+  bid_strategy?: 'LOWEST_COST_WITHOUT_CAP' | 'LOWEST_COST_WITH_BID_CAP' | 'COST_CAP';
 }
 
 const NEW_BUDGET_CAP_CENTS = 50_000;       // $500/day hard cap on creation
@@ -877,6 +882,7 @@ export async function createCampaign(args: CreateCampaignArgs): Promise<{ id: st
     status: 'PAUSED',
     special_ad_categories: JSON.stringify(args.special_ad_categories ?? []),
     buying_type: args.buying_type ?? 'AUCTION',
+    bid_strategy: args.bid_strategy ?? 'LOWEST_COST_WITHOUT_CAP',
   };
   if (args.daily_budget_cents != null) payload.daily_budget = String(args.daily_budget_cents);
 
