@@ -134,6 +134,9 @@ import {
   loadActiveRules,
   createRule,
   setRuleActive,
+  evaluateAllRules,
+  executeAutoTriggers,
+  seedDefaultRules,
 } from './rules.js';
 import {
   cioListSegments,
@@ -3268,6 +3271,83 @@ async function logAgentAction(
   }
 }
 
+// ---------- /rules — autonomous scaling rules ----------
+
+async function handleRulesCmd(chatId: number, args: string): Promise<void> {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  const sub = (parts[0] ?? '').toLowerCase();
+
+  if (sub === 'list' || sub === '') {
+    const rules = await loadActiveRules();
+    if (rules.length === 0) {
+      await bot.sendMessage(chatId, 'No active rules. Seeding defaults…');
+      const n = await seedDefaultRules();
+      await bot.sendMessage(chatId, `Seeded ${n} default rules. Run /rules list to see them.`);
+      return;
+    }
+    const lines = rules.map((r) =>
+      `#${r.id} ${r.auto_execute ? '[AUTO]' : '[notify]'} ${r.name}\n  ${r.description} (triggered ${r.trigger_count}×)`,
+    );
+    await bot.sendMessage(chatId, `Active rules (${rules.length}):\n\n${lines.join('\n\n')}`);
+    return;
+  }
+
+  if (sub === 'eval' || sub === 'run') {
+    await bot.sendMessage(chatId, 'Evaluating all rules against current account state…');
+    try {
+      const triggers = await evaluateAllRules();
+      await executeAutoTriggers(triggers);
+      if (triggers.length === 0) {
+        await bot.sendMessage(chatId, 'No rules triggered. All conditions within thresholds.');
+        return;
+      }
+      const lines = triggers.map((t) => {
+        const executed = t.executed ? ' [AUTO-EXECUTED]' : t.execution_error ? ` [ERROR: ${t.execution_error}]` : '';
+        return `• ${t.rule.name}${executed}\n  ${t.reason}${t.proposed_action ? `\n  Action: ${t.proposed_action}` : ''}`;
+      });
+      await bot.sendMessage(chatId, `Rules fired (${triggers.length}):\n\n${lines.join('\n\n')}`);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      await bot.sendMessage(chatId, `Rule evaluation failed: ${m}`);
+    }
+    return;
+  }
+
+  if (sub === 'auto' && parts[1]) {
+    const id = Number(parts[1]);
+    if (!Number.isFinite(id) || id <= 0) {
+      await bot.sendMessage(chatId, 'Usage: /rules auto <rule_id>');
+      return;
+    }
+    await supabase.from('agent_rules').update({ auto_execute: true }).eq('id', id);
+    await bot.sendMessage(chatId, `Rule #${id} set to AUTO — will execute without confirmation when triggered.`);
+    return;
+  }
+
+  if (sub === 'disable' && parts[1]) {
+    const id = Number(parts[1]);
+    if (!Number.isFinite(id) || id <= 0) {
+      await bot.sendMessage(chatId, 'Usage: /rules disable <rule_id>');
+      return;
+    }
+    await setRuleActive(id, false);
+    await bot.sendMessage(chatId, `Rule #${id} disabled.`);
+    return;
+  }
+
+  const help = [
+    '/rules — autonomous scaling rule engine',
+    '',
+    '  /rules list       — show active rules and trigger counts',
+    '  /rules eval       — run all rules now against live account data',
+    '  /rules auto <id>  — promote rule to auto-execute (no confirmation)',
+    '  /rules disable <id> — disable a rule',
+    '',
+    'Rules start as notify-only. Use /rules auto <id> once you trust them.',
+  ].join('\n');
+  await bot.sendMessage(chatId, help);
+}
+
 // ---------- /cohorts — customer quality intelligence ----------
 
 async function handleCohortsCmd(chatId: number, args: string): Promise<void> {
@@ -3835,6 +3915,11 @@ bot.on('message', async (msg) => {
               'Creative intelligence:',
               '/tag <ad> — auto-tag an ad (hook type, emotional angle, format, claim)',
               '/tag stats — breakdown of tagged ads by emotional angle',
+              '',
+              'Autonomous rules:',
+              '/rules — list active rules and trigger history',
+              '/rules eval — run all rules now against live account',
+              '/rules auto <id> — promote rule to auto-execute',
               '',
               'Market intelligence:',
               '/intel <topic> — deep multi-source landscape scan (news, Reddit, competitors, regulatory)',
@@ -4518,6 +4603,9 @@ bot.on('message', async (msg) => {
         case 'tag':
           await handleTagCmd(chatId, args);
           return;
+        case 'rules':
+          await handleRulesCmd(chatId, args);
+          return;
         case 'grant':
           await handleGrantCmd(chatId, userKey, args);
           return;
@@ -4766,6 +4854,11 @@ if (ENABLE_CRON) {
 console.log(
   `Facebook ad agent running. model=${MODEL} account=${process.env.META_AD_ACCOUNT} tz=${ACCOUNT_TZ}`,
 );
+
+// Seed default rules on boot (no-ops if rules already exist).
+seedDefaultRules()
+  .then((n) => { if (n > 0) console.log(`[rules] seeded ${n} default rules`); })
+  .catch((err) => console.warn('[rules] seedDefaultRules failed:', err));
 
 // Schema health check — fail loudly if Supabase tables are missing.
 // Memory was silently failing for hours because chat_messages didn't exist
