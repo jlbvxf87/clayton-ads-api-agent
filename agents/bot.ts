@@ -1472,6 +1472,34 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'batch_execute',
+    description:
+      "MANDATORY for any task requiring ≥5 similar tool calls (e.g. 'create 36 ads', 'pause every losing campaign', 'delete all failed lookalikes', 'tag every ad'). Never stage 5+ individual tool calls in one turn — you will lose track around call ~10 and start narrating fake progress instead of executing. batch_execute runs the SAME inner tool N times in a deterministic for-loop OUTSIDE the LLM, so all N actions are guaranteed to execute exactly once. Returns { ok, failed, total, results, errors }. One permission prompt covers the whole batch; one progress report goes to Telegram. Concurrency capped at 5 by default to avoid Meta rate limits. Examples: { tool: 'create_ad', inputs: [{adset_id, name, creative_id}, ...], description: 'Clone 12 Ghost statics into 3 new ad sets' } | { tool: 'pause_campaign', inputs: [{campaign_id: 'X'}, {campaign_id: 'Y'}], description: 'Pause 8 losing campaigns' }",
+    input_schema: {
+      type: 'object',
+      properties: {
+        tool: {
+          type: 'string',
+          description: "Name of the inner tool to invoke N times. Must be an existing tool the agent has (create_ad, pause_campaign, set_daily_budget, delete_custom_audience, create_lookalike_audience, etc).",
+        },
+        inputs: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Array of input objects, one per invocation of the inner tool.',
+        },
+        description: {
+          type: 'string',
+          description: "Plain-English label of what this batch does. Shown to the user in the permission prompt. E.g. 'Clone 12 statics into 3 ad sets'.",
+        },
+        concurrency: {
+          type: 'integer',
+          description: 'Optional parallel worker count (default 3, max 5). Lower if hitting Meta rate limits.',
+        },
+      },
+      required: ['tool', 'inputs', 'description'],
+    },
+  },
+  {
     name: 'cio_list_segments',
     description: "List all Customer.io segments (name, id, description, customer count). Use to find segment IDs for follow-up queries or to map a Meta audience to a CIO segment.",
     input_schema: { type: 'object', properties: {}, required: [] },
@@ -2190,6 +2218,76 @@ async function dispatchTool(
       const result = await deleteCustomAudience(audienceId);
       await logAgentAction(chatId, 'delete_custom_audience', audienceId, aud?.name ?? null, aud ?? null, result);
       return { ...result, deleted_name: aud?.name ?? null };
+    }
+    case 'batch_execute': {
+      const innerTool = input.tool as string;
+      const items = input.inputs as Record<string, unknown>[];
+      const desc = (input.description as string) ?? `batch ${innerTool}`;
+      const concurrency = Math.max(1, Math.min(5, Number(input.concurrency) || 3));
+
+      if (!innerTool || typeof innerTool !== 'string')
+        throw new Error('batch_execute: `tool` is required (string).');
+      if (!Array.isArray(items) || items.length === 0)
+        throw new Error('batch_execute: `inputs` must be a non-empty array.');
+      if (innerTool === 'batch_execute')
+        throw new Error('batch_execute cannot call itself.');
+
+      // The batch runs OUTSIDE the LLM. No more hallucinated progress —
+      // every iteration calls dispatchTool deterministically. Per-item
+      // permission is intentionally NOT checked: the batch itself was
+      // already gated via dispatchToolGuarded and the user confirmed it.
+      await bot.sendMessage(
+        chatId,
+        `Starting batch: ${desc}\n${items.length} actions, concurrency ${concurrency}.`,
+      );
+
+      type Outcome = { index: number; ok: boolean; result?: unknown; error?: string };
+      const outcomes: Outcome[] = new Array(items.length);
+      let nextIdx = 0;
+      const startedAt = Date.now();
+
+      async function worker(): Promise<void> {
+        for (;;) {
+          const i = nextIdx++;
+          if (i >= items.length) return;
+          try {
+            const r = await dispatchTool(innerTool, items[i], chatId);
+            outcomes[i] = { index: i, ok: true, result: r };
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err);
+            outcomes[i] = { index: i, ok: false, error: m };
+          }
+        }
+      }
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+      const ok = outcomes.filter((o) => o?.ok).length;
+      const failed = outcomes.length - ok;
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+      const reportLines: string[] = [
+        `Batch done: ${desc}`,
+        `${ok}/${items.length} succeeded in ${elapsed}s${failed > 0 ? `  (${failed} failed)` : ''}`,
+      ];
+      if (failed > 0) {
+        const firstErrs = outcomes
+          .filter((o) => o && !o.ok)
+          .slice(0, 5)
+          .map((o) => `  ✗ #${o.index + 1}: ${o.error}`);
+        reportLines.push('', 'First failures:', ...firstErrs);
+        if (failed > 5) reportLines.push(`  …and ${failed - 5} more`);
+      }
+      await bot.sendMessage(chatId, reportLines.join('\n'));
+
+      // Truncate results returned to the LLM so a 36-item run doesn't blow the
+      // tool-result token budget. Keep ids for successful + error msgs for fails.
+      const trimmed = outcomes.map((o) => ({
+        index: o.index,
+        ok: o.ok,
+        error: o.error,
+        id: (o.result as { id?: string } | undefined)?.id,
+      }));
+      return { ok, failed, total: items.length, elapsed_sec: Number(elapsed), results: trimmed };
     }
     case 'cio_list_segments': {
       const segs = await cioListSegments();
@@ -3144,6 +3242,23 @@ const WRITE_TOOL_SPECS: Record<string, WriteToolSpec> = {
     permKind: () => 'audience',
     paramsFor: () => ({}),
     targetLabel: (i) => `delete audience ${i.audience_id}`,
+  },
+  batch_execute: {
+    // Permission kind is inherited from the inner tool so a batch of
+    // create_ad needs 'create_ad' permission, a batch of pause needs 'pause',
+    // etc. A standing-order /grant on the inner kind covers the whole batch.
+    permKind: (i) => {
+      const innerName = i.tool as string;
+      const innerSpec = innerName ? WRITE_TOOL_SPECS[innerName] : undefined;
+      // Fall back to 'rule' for unknown inner tools — generic write gate.
+      return innerSpec ? innerSpec.permKind({}) : 'rule';
+    },
+    paramsFor: () => ({}),
+    targetLabel: (i) => {
+      const n = Array.isArray(i.inputs) ? i.inputs.length : '?';
+      const desc = (i.description as string) ?? `batch ${i.tool}`;
+      return `${desc} (${n} actions via batch_execute)`;
+    },
   },
   cio_send_event: {
     permKind: () => 'cio_event',
