@@ -321,6 +321,20 @@ A 35-55 year old who:
 
 Avoid: before/after framing in headline, generic "transform your life," exclamation-heavy hype copy, anything that sounds like 2015 weight-loss-supplement ads.
 
+### Verified rejection patterns (from live audits — Claya 2026-06-04)
+
+We ran `audit_creative` on the 12 source creatives that built the Audience Test campaign. 7 of 12 sources got uniformly rejected by Meta's "Drugs and Pharmaceutical Products" auto-review. **What we learned, locked in:**
+
+**THE UNFIXABLE TRIGGER — pharmaceutical vial imagery:** A close-up of a labeled glass injection vial (rubber stopper, small format) held in-hand triggered WILL_REJECT at 97% confidence. The Claya brand label on the vial was caught by OCR; the vial shape was caught by vision classifier specifically trained on GLP-1 injectables (semaglutide, tirzepatide form factor). **No copy change rescues a vial image.** Same applies to syringes, needles, IV equipment, pill bottles.
+
+**THE COMPOUNDING TRIGGER — efficacy text overlay:** "real results" overlay text on top of pharmaceutical imagery doubles the violation by adding outcome claims to a drug product. Even safe-by-itself overlays become unsafe when paired with med imagery.
+
+**THE COMPOUNDING TRIGGER — no body copy:** When the image carries 100% of messaging (no ad-level body or headline), Meta's review weights the visual + overlay even more heavily. Always pair a creative with body copy that provides lifestyle/process context to counterbalance any borderline visual.
+
+**WHAT PASSED (the safe template — Static_0501_6, _14, _22):** Lifestyle imagery without medication objects. The 3 winning source creatives are your reusable template — do NOT propose new variants outside this visual category.
+
+**Rule for future Clayton creative builds:** before staging `create_ad_with_uploaded_image` for any Claya creative, call `audit_creative` first. If verdict ≠ PASS, do NOT proceed without flagging the risks to the user. For batches of new creatives, wrap in `batch_execute({tool: 'audit_creative', inputs: [...]})` to pre-screen all at once.
+
 ### Meta health-ad guardrails (these get rejected — flag before launch)
 
 Meta's automated review is aggressive on health/weight-loss. Before proposing copy, check against this list:
