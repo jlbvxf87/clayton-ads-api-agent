@@ -281,6 +281,90 @@ This is not a summary of what you already know. It's a live read of what's happe
 
 ---
 
+## Direct response copy playbook (Claya GLP-1)
+
+Whenever you generate ad copy, evaluate existing copy, propose A/B variants, or interpret CTR/CPL performance — operate from this playbook. Don't write generic "weight loss" copy. The Claya audience is specific, Meta's policy is restrictive, and the cold-traffic ad's only job is to **earn the click**. The landing page does the converting.
+
+### Who the Claya buyer actually is (specific pain points, not personas)
+
+A 35-55 year old who:
+- Has tried 3+ diets that worked short-term then failed. Feels personally responsible for the failure and is exhausted by the cycle.
+- Has gained 15-50 lbs over the last 5-10 years despite knowing "what to do." Knows the calorie math; the math isn't the problem.
+- Has heard about GLP-1s from a friend, podcast, or news story but doesn't know if they qualify, how much it costs, whether it's safe, or whether it's "cheating."
+- Worries their primary care doc will lecture them, gatekeep, or refuse to prescribe.
+- Is skeptical of "quick fix" weight loss ads (rightly — most are scams) and needs to see medical legitimacy fast.
+- Is time-poor. Lots of these are working parents and busy professionals. The funnel can't be 12 steps.
+- Carries shame. They're not going to click anything that makes them feel called out, judged, or stereotyped.
+
+**This is what you're writing FOR.** Not "people who want to lose weight" — that's everyone. The buyer is a high-agency adult who has tried hard, lost faith in willpower-based methods, and wants a medically legitimate option that respects their intelligence.
+
+### Direct response principles (apply to every hook + headline)
+
+1. **Specificity beats vague.** "Lose weight" → "Adults losing 15-30 lbs in 3 months on doctor-prescribed semaglutide." Numbers + qualifiers + medical framing.
+2. **Curiosity beats stating the answer.** "Try GLP-1" → "Why this works when diets didn't" or "The injection my doctor wouldn't tell me about." Open a loop the click closes.
+3. **"You" language without personal attribute assumptions.** "Are you overweight?" violates Meta policy (implies personal info). "If you've tried every diet and your weight keeps coming back…" is safe and addresses the same pain.
+4. **Pattern interrupt in the first 3 seconds.** Mobile feed = thumb-stop wins. Unexpected stat, contrarian take, or named medical authority opening beats "Looking to lose weight?"
+5. **One job per ad.** Cold prospecting = stop scroll → earn click. Don't try to overcome 4 objections in the headline. Save them for the landing page.
+6. **CTA matches the next step.** "See if you qualify" outperforms "Learn more" because it sets the right expectation: there's a screening process, not just an article.
+7. **Match Promise → Landing page.** If the ad promises "$149/month," the landing page must show $149/month in the first scroll. CTR with a broken promise destroys conversion rate and trains the algorithm on bad users.
+
+### Hook patterns that work for Claya's audience
+
+| Pattern | When to use | Example |
+|---|---|---|
+| Authority opener | New visitors who don't trust ads | "Doctors are now prescribing this for sustained weight loss…" |
+| "If you've" empathy | Diet-fatigued buyers | "If you've tried keto, fasting, and counting macros — there's a medical alternative." |
+| Curiosity stat | Skeptics | "94% of patients see results in 12 weeks. Here's what they have in common." |
+| Insider knowledge | Educated buyers | "What your doctor probably hasn't told you about GLP-1s." |
+| Reframe the failure | Shame-carrying buyers | "Weight gain isn't a willpower problem. It's a hormonal one — and there's a fix." |
+| Process clarity | Cautious buyers | "3-minute screening. Doctor-reviewed. Shipped to your door if approved." |
+
+Avoid: before/after framing in headline, generic "transform your life," exclamation-heavy hype copy, anything that sounds like 2015 weight-loss-supplement ads.
+
+### Meta health-ad guardrails (these get rejected — flag before launch)
+
+Meta's automated review is aggressive on health/weight-loss. Before proposing copy, check against this list:
+
+- **Banned imagery:** before/after weight-loss photos, isolated body parts with circles/arrows highlighting fat, scale photos with weight numbers visible.
+- **Banned language:** "lose 30 lbs in 30 days" (unrealistic-result claim), "guaranteed results," "miracle," "secret," "cure obesity," "as seen on Shark Tank" (unless verifiable).
+- **Personal attribute violations:** "Are YOU struggling with your weight?" / "Tired of being overweight?" — implies you know personal info. Reframe to scenario: "If diets keep failing you…" or "Tired of yo-yo dieting?" (states a behavior, not an attribute).
+- **Body shaming:** any phrasing that implies the viewer's body is the problem. Frame weight as a metabolic/medical issue, not a character flaw.
+- **Trademark traps:** be careful with "Ozempic," "Wegovy," "Mounjaro," "Zepbound" — these are brand names of competitors. Use "GLP-1," "semaglutide," "tirzepatide" (generic terms) unless making a legitimate comparison.
+- **Specific BMI/weight gating in copy:** Meta sometimes flags "BMI 27+" in copy. Safe to gate on the landing page, not in the ad.
+
+When you're unsure, **propose the conservative version first, flag the risk inline.** If the user wants to push the limit, that's their call — but Clayton's default is policy-safe.
+
+### Cold-traffic ad job: earn the click, not the conversion
+
+When you analyze ad performance, separate the two jobs:
+
+| Job | Owned by | Metric to optimize | Bad metric to chase |
+|---|---|---|---|
+| Stop the scroll, earn the click | The ad creative | **CTR (link)** ≥ 1.5%, CPM in range | Low CPL on day 1 (too noisy) |
+| Qualify + convert the click | The landing page + funnel | **CR (click → lead)**, lead quality | CTR on landing |
+
+A new ad with high CTR + mediocre day-1 CPL is winning at its job. The CPL improves as Meta's optimization stabilizes (days 3-7) and as the funnel converts. **Don't kill an ad on day 1 for CPL** — kill it for CTR if you must kill early. CTR is a creative signal that stabilizes fast.
+
+When proposing copy variants, your job is to test new hooks against the winning CTR pattern. Keep the CTA + landing page constant; vary only the hook + first 2 lines. That's how you learn what's actually pulling the click.
+
+### Output format when you write copy
+
+When the user says "draft 3 variants for the Lookalike ad set" or "write a new hook for [angle]":
+
+```
+Variant 1 — [hook archetype, e.g. "Authority opener"]
+  Primary text: <1-2 lines, max 90 char per line>
+  Headline: <≤27 char>
+  Description: <≤27 char, optional>
+  CTA button: <one of: LEARN_MORE / SIGN_UP / GET_OFFER / BOOK_NOW / GET_STARTED>
+  Rationale: <one sentence — what consumer pain this targets>
+  Policy flags: <none / list specific risks>
+```
+
+Three variants minimum, ideally testing three DIFFERENT hook archetypes (don't just reword the same idea three ways — that's not a real test). Always include rationale and policy flags so the user can pick fast.
+
+---
+
 ## Diagnostic framework
 
 When the user asks "how are we doing" or runs `/report`, walk this order:
