@@ -1176,3 +1176,388 @@ export async function getPixelHealth(pixelId?: string): Promise<PixelHealthSumma
   }
   return out;
 }
+
+// ============================================================
+// Extended read surfaces — P0/P1/P2 from the read-tool audit
+// ============================================================
+
+// ---------- 1. Breakdowns (placement / age / gender / device / hour / region) ----------
+
+export type BreakdownDim =
+  | 'age'
+  | 'gender'
+  | 'country'
+  | 'region'
+  | 'dma'
+  | 'impression_device'
+  | 'device_platform'
+  | 'publisher_platform'
+  | 'platform_position'
+  | 'hourly_stats_aggregated_by_advertiser_time_zone';
+
+export interface InsightBreakdownRow {
+  spend: number;
+  impressions: number;
+  clicks: number;
+  ctr: number | null;
+  cpm: number | null;
+  cpc: number | null;
+  reach?: number;
+  frequency?: number;
+  actions?: Array<{ action_type: string; value: number }>;
+  // Dimension columns surface here — e.g. age:'25-34', gender:'female', publisher_platform:'facebook'
+  [dimKey: string]: unknown;
+}
+
+export async function getInsightsBreakdown(args: {
+  level: 'account' | 'campaign' | 'adset' | 'ad';
+  parentId?: string; // omit for account-level
+  datePreset: DatePreset;
+  breakdowns: BreakdownDim[];
+}): Promise<InsightBreakdownRow[]> {
+  const path = args.parentId
+    ? `/${args.parentId}/insights`
+    : `/${AD_ACCOUNT}/insights`;
+  const fields = 'spend,impressions,clicks,ctr,cpm,cpc,reach,frequency,actions';
+  const rows = await paginated<Record<string, unknown>>(path, {
+    fields,
+    level: args.level,
+    date_preset: args.datePreset,
+    breakdowns: args.breakdowns.join(','),
+    limit: '500',
+  });
+  return rows.map((r) => ({
+    ...r,
+    spend: Number(r.spend ?? 0),
+    impressions: Number(r.impressions ?? 0),
+    clicks: Number(r.clicks ?? 0),
+    ctr: r.ctr != null ? Number(r.ctr) : null,
+    cpm: r.cpm != null ? Number(r.cpm) : null,
+    cpc: r.cpc != null ? Number(r.cpc) : null,
+    reach: r.reach != null ? Number(r.reach) : undefined,
+    frequency: r.frequency != null ? Number(r.frequency) : undefined,
+    actions: Array.isArray(r.actions)
+      ? (r.actions as Array<{ action_type: string; value: string }>).map((a) => ({
+          action_type: a.action_type,
+          value: Number(a.value) || 0,
+        }))
+      : undefined,
+  }));
+}
+
+// ---------- 2. Quality rankings + video metrics (ad level) ----------
+
+export interface AdQualityScore {
+  ad_id: string;
+  ad_name?: string;
+  quality_ranking?: string;            // BELOW_AVERAGE_10 / BELOW_AVERAGE_20 / BELOW_AVERAGE_35 / AVERAGE / ABOVE_AVERAGE
+  engagement_rate_ranking?: string;
+  conversion_rate_ranking?: string;
+  video_play_actions?: number;
+  video_p25_watched?: number;
+  video_p50_watched?: number;
+  video_p75_watched?: number;
+  video_p100_watched?: number;
+  video_avg_time_watched_sec?: number;
+}
+
+const QUALITY_INSIGHT_FIELDS = [
+  'ad_id', 'ad_name',
+  'quality_ranking', 'engagement_rate_ranking', 'conversion_rate_ranking',
+  'video_play_actions',
+  'video_p25_watched_actions',
+  'video_p50_watched_actions',
+  'video_p75_watched_actions',
+  'video_p100_watched_actions',
+  'video_avg_time_watched_actions',
+].join(',');
+
+export async function getAdQualityScores(
+  parentId: string,
+  datePreset: DatePreset,
+): Promise<AdQualityScore[]> {
+  const rows = await paginated<Record<string, unknown>>(`/${parentId}/insights`, {
+    fields: QUALITY_INSIGHT_FIELDS,
+    level: 'ad',
+    date_preset: datePreset,
+    limit: '500',
+  });
+  const firstAction = (key: string, row: Record<string, unknown>): number | undefined => {
+    const arr = row[key];
+    if (!Array.isArray(arr) || arr.length === 0) return undefined;
+    const v = (arr[0] as { value?: string | number }).value;
+    return v != null ? Number(v) : undefined;
+  };
+  return rows.map((r) => ({
+    ad_id: (r.ad_id as string) ?? '',
+    ad_name: (r.ad_name as string) ?? undefined,
+    quality_ranking: r.quality_ranking as string | undefined,
+    engagement_rate_ranking: r.engagement_rate_ranking as string | undefined,
+    conversion_rate_ranking: r.conversion_rate_ranking as string | undefined,
+    video_play_actions: firstAction('video_play_actions', r),
+    video_p25_watched: firstAction('video_p25_watched_actions', r),
+    video_p50_watched: firstAction('video_p50_watched_actions', r),
+    video_p75_watched: firstAction('video_p75_watched_actions', r),
+    video_p100_watched: firstAction('video_p100_watched_actions', r),
+    video_avg_time_watched_sec: firstAction('video_avg_time_watched_actions', r),
+  }));
+}
+
+// ---------- 3. Ad set learning stage info ----------
+
+export interface AdSetLearningStatus {
+  adset_id: string;
+  adset_name: string;
+  status: string;
+  effective_status: string;
+  learning_phase?: 'LEARNING' | 'LEARNING_LIMITED' | 'SUCCESS' | 'UNKNOWN';
+  conversions_count?: number;
+  conversions_needed?: number;
+  exit_reason?: string;
+}
+
+export async function getAdSetLearningStatus(adSetId: string): Promise<AdSetLearningStatus> {
+  const { data } = await meta.get(`/${adSetId}`, {
+    params: { fields: 'id,name,status,effective_status,learning_stage_info' },
+  });
+  const info = (data.learning_stage_info ?? {}) as Record<string, unknown>;
+  return {
+    adset_id: data.id,
+    adset_name: data.name,
+    status: data.status,
+    effective_status: data.effective_status,
+    learning_phase: info.status as AdSetLearningStatus['learning_phase'],
+    conversions_count: info.conversions != null ? Number(info.conversions) : undefined,
+    conversions_needed: info.conversions_threshold != null ? Number(info.conversions_threshold) : undefined,
+    exit_reason: info.exit_reason as string | undefined,
+  };
+}
+
+// ---------- 4. Activity log ----------
+
+export interface ActivityLogRow {
+  event_time: string;
+  event_type: string;
+  actor_id?: string;
+  actor_name?: string;
+  object_id?: string;
+  object_type?: string;
+  object_name?: string;
+  extra_data?: string;
+}
+
+export async function listActivityLog(opts?: {
+  sinceIso?: string;
+  untilIso?: string;
+  limit?: number;
+}): Promise<ActivityLogRow[]> {
+  const params: Record<string, string> = {
+    fields: 'event_time,event_type,actor_id,actor_name,object_id,object_type,object_name,extra_data',
+    limit: String(opts?.limit ?? 100),
+  };
+  if (opts?.sinceIso && opts?.untilIso) {
+    params.time_range = JSON.stringify({ since: opts.sinceIso, until: opts.untilIso });
+  } else if (opts?.sinceIso) {
+    params.since = opts.sinceIso;
+  }
+  return paginated<ActivityLogRow>(`/${AD_ACCOUNT}/activities`, params);
+}
+
+// ---------- 5. Targeting search ----------
+
+export interface TargetingSearchResult {
+  id: string;
+  name: string;
+  audience_size_lower?: number;
+  audience_size_upper?: number;
+  path?: string[];
+  description?: string;
+  topic?: string;
+}
+
+export async function searchAdInterests(query: string, limit = 25): Promise<TargetingSearchResult[]> {
+  const { data } = await meta.get('/search', {
+    params: { type: 'adinterest', q: query, limit: String(limit) },
+  });
+  return (data.data ?? []).map((r: Record<string, unknown>) => ({
+    id: r.id as string,
+    name: r.name as string,
+    audience_size_lower: r.audience_size_lower_bound != null ? Number(r.audience_size_lower_bound) : undefined,
+    audience_size_upper: r.audience_size_upper_bound != null ? Number(r.audience_size_upper_bound) : undefined,
+    path: r.path as string[] | undefined,
+    description: r.description as string | undefined,
+    topic: r.topic as string | undefined,
+  }));
+}
+
+export async function suggestAdInterests(seedInterests: string[], limit = 25): Promise<TargetingSearchResult[]> {
+  const { data } = await meta.get('/search', {
+    params: { type: 'adinterestsuggestion', interest_list: JSON.stringify(seedInterests), limit: String(limit) },
+  });
+  return (data.data ?? []).map((r: Record<string, unknown>) => ({
+    id: r.id as string,
+    name: r.name as string,
+    audience_size_lower: r.audience_size != null ? Number(r.audience_size) : undefined,
+    audience_size_upper: r.audience_size != null ? Number(r.audience_size) : undefined,
+    path: r.path as string[] | undefined,
+  }));
+}
+
+// ---------- 6. Meta recommendations ----------
+
+export interface MetaRecommendation {
+  code: number;
+  title: string;
+  message?: string;
+  importance?: 'HIGH' | 'MEDIUM' | 'LOW';
+  recommendation_data?: Record<string, unknown>;
+}
+
+export async function getMetaRecommendations(
+  entityId: string, // campaign_id or adset_id
+): Promise<MetaRecommendation[]> {
+  const { data } = await meta.get(`/${entityId}`, {
+    params: { fields: 'recommendations' },
+  });
+  return (data.recommendations ?? []) as MetaRecommendation[];
+}
+
+// ---------- 7. Custom conversions ----------
+
+export interface CustomConversion {
+  id: string;
+  name: string;
+  description?: string;
+  custom_event_type?: string;
+  rule?: string;
+  default_conversion_value?: number;
+  pixel?: { id: string };
+  is_archived?: boolean;
+  creation_time?: string;
+}
+
+export async function listCustomConversions(): Promise<CustomConversion[]> {
+  return paginated<CustomConversion>(`/${AD_ACCOUNT}/customconversions`, {
+    fields: 'id,name,description,custom_event_type,rule,default_conversion_value,pixel,is_archived,creation_time',
+    limit: '100',
+  });
+}
+
+// ---------- 8. Ad previews ----------
+
+export type AdPreviewFormat =
+  | 'MOBILE_FEED_STANDARD'
+  | 'DESKTOP_FEED_STANDARD'
+  | 'INSTAGRAM_STANDARD'
+  | 'INSTAGRAM_STORY'
+  | 'INSTAGRAM_REELS'
+  | 'FACEBOOK_REELS_MOBILE'
+  | 'MESSENGER_MOBILE_INBOX_MEDIA'
+  | 'AUDIENCE_NETWORK_REWARDED_VIDEO';
+
+export async function getAdPreview(adId: string, format: AdPreviewFormat = 'MOBILE_FEED_STANDARD'): Promise<{ html: string; format: string }> {
+  const { data } = await meta.get(`/${adId}/previews`, {
+    params: { ad_format: format },
+  });
+  const html = (data.data?.[0]?.body as string | undefined) ?? '';
+  return { html, format };
+}
+
+// ---------- 9. Auction insights (competitor overlap) ----------
+
+export interface AuctionInsightRow {
+  spend: number;
+  impressions: number;
+  // Auction-action breakdowns surface competitor data here
+  [k: string]: unknown;
+}
+
+export async function getAuctionInsights(args: {
+  level: 'campaign' | 'adset' | 'ad';
+  parentId?: string;
+  datePreset: DatePreset;
+}): Promise<AuctionInsightRow[]> {
+  const path = args.parentId ? `/${args.parentId}/insights` : `/${AD_ACCOUNT}/insights`;
+  return paginated<AuctionInsightRow>(path, {
+    fields: 'spend,impressions',
+    level: args.level,
+    date_preset: args.datePreset,
+    action_breakdowns: '["auction_competitor","auction_overlap"]',
+    limit: '200',
+  });
+}
+
+// ---------- 10. Delivery / reach estimate ----------
+
+export interface DeliveryEstimate {
+  estimate_ready: boolean;
+  estimate_mau_lower_bound: number;
+  estimate_mau_upper_bound: number;
+  estimate_dau?: number;
+  daily_outcomes_curve?: Array<{ spend: number; reach: number; impressions: number; actions: number }>;
+}
+
+export async function getDeliveryEstimate(args: {
+  optimization_goal: string;
+  targeting: Record<string, unknown>;
+  daily_budget_cents?: number;
+}): Promise<DeliveryEstimate> {
+  const params: Record<string, string> = {
+    optimization_goal: args.optimization_goal,
+    targeting_spec: JSON.stringify(args.targeting),
+  };
+  if (args.daily_budget_cents != null) params.daily_budget = String(args.daily_budget_cents);
+  const { data } = await meta.get(`/${AD_ACCOUNT}/delivery_estimate`, { params });
+  const row = (data.data?.[0] ?? {}) as Record<string, unknown>;
+  return {
+    estimate_ready: Boolean(row.estimate_ready),
+    estimate_mau_lower_bound: Number(row.estimate_mau_lower_bound ?? 0),
+    estimate_mau_upper_bound: Number(row.estimate_mau_upper_bound ?? 0),
+    estimate_dau: row.estimate_dau != null ? Number(row.estimate_dau) : undefined,
+    daily_outcomes_curve: row.daily_outcomes_curve as DeliveryEstimate['daily_outcomes_curve'],
+  };
+}
+
+// ---------- 11. Account-level aggregate insights ----------
+
+export interface AccountInsight {
+  account_id: string;
+  account_name?: string;
+  spend: number;
+  impressions: number;
+  clicks: number;
+  ctr: number | null;
+  cpm: number | null;
+  cpc: number | null;
+  reach?: number;
+  frequency?: number;
+  actions?: Array<{ action_type: string; value: number }>;
+}
+
+export async function getAccountInsights(datePreset: DatePreset): Promise<AccountInsight> {
+  const rows = await paginated<Record<string, unknown>>(`/${AD_ACCOUNT}/insights`, {
+    fields: 'account_id,account_name,spend,impressions,clicks,ctr,cpm,cpc,reach,frequency,actions',
+    level: 'account',
+    date_preset: datePreset,
+    limit: '1',
+  });
+  const r = rows[0] ?? {};
+  return {
+    account_id: (r.account_id as string) ?? AD_ACCOUNT,
+    account_name: r.account_name as string | undefined,
+    spend: Number(r.spend ?? 0),
+    impressions: Number(r.impressions ?? 0),
+    clicks: Number(r.clicks ?? 0),
+    ctr: r.ctr != null ? Number(r.ctr) : null,
+    cpm: r.cpm != null ? Number(r.cpm) : null,
+    cpc: r.cpc != null ? Number(r.cpc) : null,
+    reach: r.reach != null ? Number(r.reach) : undefined,
+    frequency: r.frequency != null ? Number(r.frequency) : undefined,
+    actions: Array.isArray(r.actions)
+      ? (r.actions as Array<{ action_type: string; value: string }>).map((a) => ({
+          action_type: a.action_type,
+          value: Number(a.value) || 0,
+        }))
+      : undefined,
+  };
+}

@@ -37,6 +37,20 @@ import {
   listCustomAudiences,
   createLookalikeAudience,
   deleteCustomAudience,
+  getInsightsBreakdown,
+  getAdQualityScores,
+  getAdSetLearningStatus,
+  listActivityLog,
+  searchAdInterests,
+  suggestAdInterests,
+  getMetaRecommendations,
+  listCustomConversions,
+  getAdPreview,
+  getAuctionInsights,
+  getDeliveryEstimate,
+  getAccountInsights,
+  type BreakdownDim,
+  type AdPreviewFormat,
   AD_ACCOUNTS,
   type Campaign,
   type AdSet,
@@ -1472,6 +1486,145 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'get_insights_breakdown',
+    description: "Pull performance metrics broken down by ONE OR MORE dimensions. The single highest-value diagnostic — answers 'which placement converts best?' / 'which age segment is driving spend?' / 'are we losing money on Audience Network?' / 'what hours of the day perform?'. Returns spend, impressions, clicks, CTR, CPM, CPC, reach, frequency, actions[] per dimension combination. Available breakdown dims: 'age', 'gender', 'country', 'region', 'dma', 'impression_device', 'device_platform', 'publisher_platform', 'platform_position', 'hourly_stats_aggregated_by_advertiser_time_zone'. Pass 1-2 dims; passing 3+ explodes row count.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        level: { type: 'string', enum: ['account', 'campaign', 'adset', 'ad'], description: "Granularity. 'account' aggregates everything; the rest filter to parent_id." },
+        parent_id: { type: 'string', description: 'Required for non-account levels.' },
+        date_preset: { type: 'string', description: "e.g. 'today','yesterday','last_7d','last_14d','last_30d'" },
+        breakdowns: { type: 'array', items: { type: 'string' }, description: 'Array of breakdown dims (see description).' },
+      },
+      required: ['level', 'date_preset', 'breakdowns'],
+    },
+  },
+  {
+    name: 'get_ad_quality_scores',
+    description: "Pull Meta's quality diamond ratings + video watch metrics for every ad under a campaign/adset/ad. quality_ranking / engagement_rate_ranking / conversion_rate_ranking each rate the ad as BELOW_AVERAGE_10 (worst 10%) → BELOW_AVERAGE_20 → BELOW_AVERAGE_35 → AVERAGE → ABOVE_AVERAGE. **Meta's own verdict — the strongest single signal for 'why is this ad not working'**. Two BELOW_AVERAGE rankings means the creative is the problem, not the audience. Also returns video watch metrics (p25/50/75/100, avg time watched) for UGC video ads — early drop-off is the leading indicator of fatigue.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        parent_id: { type: 'string', description: 'Campaign / adset / ad ID to scan ads under.' },
+        date_preset: { type: 'string', description: "e.g. 'last_7d'" },
+      },
+      required: ['parent_id', 'date_preset'],
+    },
+  },
+  {
+    name: 'get_ad_set_learning_status',
+    description: "Get Meta's official learning-phase status for an ad set. Returns LEARNING (still optimizing, expect noisy data), LEARNING_LIMITED (stuck — needs more conversions or audience expansion), or SUCCESS (out of learning, results are reliable). Includes conversions_count and conversions_needed so you know how close it is to exiting learning. **Use before pausing any ad set on noisy CPL — if it's still LEARNING, hold and wait.**",
+    input_schema: {
+      type: 'object',
+      properties: {
+        adset_id: { type: 'string' },
+      },
+      required: ['adset_id'],
+    },
+  },
+  {
+    name: 'list_activity_log',
+    description: "Pull Meta's audit trail of changes on the ad account — who changed what and when. Use to answer 'who reactivated Ghost?', 'when was this budget changed?', 'what happened to this campaign last week?'. Returns event_time, event_type (CREATE / UPDATE / DELETE), actor_name (the FB user who made the change), object_type (campaign/adset/ad), object_name, extra_data (what specifically changed). Optionally pass since_iso / until_iso to bound the window.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        since_iso: { type: 'string', description: 'ISO 8601 start time. Optional.' },
+        until_iso: { type: 'string', description: 'ISO 8601 end time. Optional.' },
+        limit: { type: 'integer', description: 'Max rows (default 100, max 500).' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'search_ad_interests',
+    description: "Search Meta's targeting taxonomy for valid interest IDs by keyword. Returns id, name, audience size bounds, taxonomy path. Use when building ad sets that target interests — many interest IDs from old playbooks are deprecated. Validates that an interest still exists before you stage create_adset with it. For best results, search broad terms ('Healthy diet' / 'Physical fitness') — niche health terms like 'Ozempic' or 'GLP-1' have mostly been removed from Meta's taxonomy.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        limit: { type: 'integer', description: 'Default 25' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'suggest_ad_interests',
+    description: "Given 1-3 seed interest names, returns related interests Meta suggests for expansion. Use to discover new audiences when you already have one working interest. E.g. seed_interests=['Healthy diet'] → returns Human nutrition, Physical fitness, Yoga, Weight training, etc.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        seed_interests: { type: 'array', items: { type: 'string' }, description: 'Names of known-good interests' },
+        limit: { type: 'integer', description: 'Default 25' },
+      },
+      required: ['seed_interests'],
+    },
+  },
+  {
+    name: 'get_meta_recommendations',
+    description: "Pull Meta's own optimization recommendations for a campaign or ad set. Returns the same suggestions you see in Ads Manager: 'Consolidate ad sets', 'Increase budget', 'Expand audience', 'Use Advantage+ placements', etc. Each rec has code, title, message, importance (HIGH/MEDIUM/LOW). Use as a sanity check — Meta usually catches obvious structural issues you might miss.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        entity_id: { type: 'string', description: 'Campaign or ad set ID' },
+      },
+      required: ['entity_id'],
+    },
+  },
+  {
+    name: 'list_custom_conversions',
+    description: "List every Custom Conversion configured on the ad account — id, name, rule, event_type, default value, pixel association, archived state. Use when setting up new campaigns optimizing for downstream events (Lead, Purchase, Add to Cart) so you reference the correct CC_id, not raw pixel events.",
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_ad_preview',
+    description: "Render a single ad as it will appear in the wild and return Meta's HTML preview. Use when reviewing creative without opening Ads Manager. Format options: MOBILE_FEED_STANDARD (default), DESKTOP_FEED_STANDARD, INSTAGRAM_STANDARD, INSTAGRAM_STORY, INSTAGRAM_REELS, FACEBOOK_REELS_MOBILE, MESSENGER_MOBILE_INBOX_MEDIA, AUDIENCE_NETWORK_REWARDED_VIDEO.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        ad_id: { type: 'string' },
+        format: { type: 'string', description: 'Default MOBILE_FEED_STANDARD' },
+      },
+      required: ['ad_id'],
+    },
+  },
+  {
+    name: 'get_auction_insights',
+    description: "Pull auction-level competitor data showing where you're losing impressions and to whom. Returns spend, impressions, and competitor-overlap dimensions. Use when CPL spikes and you suspect competitor pressure (very common in GLP-1: Hims, Ro, etc. running new offers). High competitor overlap on a single audience = the audience is saturated; expand or shift.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        level: { type: 'string', enum: ['campaign', 'adset', 'ad'] },
+        parent_id: { type: 'string' },
+        date_preset: { type: 'string', description: "e.g. 'last_7d'" },
+      },
+      required: ['level', 'date_preset'],
+    },
+  },
+  {
+    name: 'get_delivery_estimate',
+    description: "Get Meta's projected audience size + daily reach BEFORE launching an ad set. Returns estimate_mau_lower / _upper bounds (matching the size shown in Ads Manager when you build targeting), plus an outcomes curve at different spend levels. Use to vet new targeting specs — if the estimate is <100K people, the audience is too narrow; >50M, too broad.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        optimization_goal: { type: 'string', description: "e.g. 'OFFSITE_CONVERSIONS', 'LEAD_GENERATION'" },
+        targeting: { type: 'object', description: 'Meta targeting spec — geo_locations, age, interests, custom_audiences, etc.' },
+        daily_budget_dollars: { type: 'number', description: 'Optional daily budget for outcome-curve estimation' },
+      },
+      required: ['optimization_goal', 'targeting'],
+    },
+  },
+  {
+    name: 'get_account_insights',
+    description: "One-shot aggregate of the WHOLE ad account for a date preset — total spend, impressions, clicks, CTR, CPM, CPC, reach, frequency, and full actions[] (every conversion event Meta saw). Use for top-level dashboards or when the user asks 'how's the account doing today/this week'. Faster than summing campaign rows.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        date_preset: { type: 'string', description: "e.g. 'today','yesterday','last_7d'" },
+      },
+      required: ['date_preset'],
+    },
+  },
+  {
     name: 'batch_execute',
     description:
       "MANDATORY for any task requiring ≥5 similar tool calls (e.g. 'create 36 ads', 'pause every losing campaign', 'delete all failed lookalikes', 'tag every ad'). Never stage 5+ individual tool calls in one turn — you will lose track around call ~10 and start narrating fake progress instead of executing. batch_execute runs the SAME inner tool N times in a deterministic for-loop OUTSIDE the LLM, so all N actions are guaranteed to execute exactly once. Returns { ok, failed, total, results, errors }. One permission prompt covers the whole batch; one progress report goes to Telegram. Concurrency capped at 5 by default to avoid Meta rate limits. Examples: { tool: 'create_ad', inputs: [{adset_id, name, creative_id}, ...], description: 'Clone 12 Ghost statics into 3 new ad sets' } | { tool: 'pause_campaign', inputs: [{campaign_id: 'X'}, {campaign_id: 'Y'}], description: 'Pause 8 losing campaigns' }",
@@ -2218,6 +2371,70 @@ async function dispatchTool(
       const result = await deleteCustomAudience(audienceId);
       await logAgentAction(chatId, 'delete_custom_audience', audienceId, aud?.name ?? null, aud ?? null, result);
       return { ...result, deleted_name: aud?.name ?? null };
+    }
+    case 'get_insights_breakdown': {
+      const level = input.level as 'account' | 'campaign' | 'adset' | 'ad';
+      const dp = input.date_preset as Parameters<typeof getInsightsBreakdown>[0]['datePreset'];
+      const breakdowns = input.breakdowns as BreakdownDim[];
+      return await getInsightsBreakdown({
+        level,
+        parentId: input.parent_id as string | undefined,
+        datePreset: dp,
+        breakdowns,
+      });
+    }
+    case 'get_ad_quality_scores': {
+      const rows = await getAdQualityScores(
+        input.parent_id as string,
+        input.date_preset as Parameters<typeof getAdQualityScores>[1],
+      );
+      return rows;
+    }
+    case 'get_ad_set_learning_status': {
+      return await getAdSetLearningStatus(input.adset_id as string);
+    }
+    case 'list_activity_log': {
+      return await listActivityLog({
+        sinceIso: input.since_iso as string | undefined,
+        untilIso: input.until_iso as string | undefined,
+        limit: input.limit as number | undefined,
+      });
+    }
+    case 'search_ad_interests': {
+      return await searchAdInterests(input.query as string, (input.limit as number | undefined) ?? 25);
+    }
+    case 'suggest_ad_interests': {
+      return await suggestAdInterests(input.seed_interests as string[], (input.limit as number | undefined) ?? 25);
+    }
+    case 'get_meta_recommendations': {
+      return await getMetaRecommendations(input.entity_id as string);
+    }
+    case 'list_custom_conversions': {
+      return await listCustomConversions();
+    }
+    case 'get_ad_preview': {
+      const fmt = (input.format as AdPreviewFormat | undefined) ?? 'MOBILE_FEED_STANDARD';
+      const r = await getAdPreview(input.ad_id as string, fmt);
+      // HTML can be very long — truncate for token budget
+      return { format: r.format, html_excerpt: r.html.slice(0, 4000), html_length: r.html.length };
+    }
+    case 'get_auction_insights': {
+      return await getAuctionInsights({
+        level: input.level as 'campaign' | 'adset' | 'ad',
+        parentId: input.parent_id as string | undefined,
+        datePreset: input.date_preset as Parameters<typeof getAuctionInsights>[0]['datePreset'],
+      });
+    }
+    case 'get_delivery_estimate': {
+      const dollars = input.daily_budget_dollars as number | undefined;
+      return await getDeliveryEstimate({
+        optimization_goal: input.optimization_goal as string,
+        targeting: (input.targeting as Record<string, unknown>) ?? {},
+        daily_budget_cents: dollars != null ? Math.round(dollars * 100) : undefined,
+      });
+    }
+    case 'get_account_insights': {
+      return await getAccountInsights(input.date_preset as Parameters<typeof getAccountInsights>[0]);
     }
     case 'batch_execute': {
       const innerTool = input.tool as string;
