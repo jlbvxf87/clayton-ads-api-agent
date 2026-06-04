@@ -127,6 +127,18 @@ function num(v: unknown, fallback = 0): number {
   return fallback;
 }
 
+// Skip rule evaluation for campaigns younger than min_days_active so a
+// learning-phase campaign isn't paused on a noisy 2-day data point.
+function tooYoung(c: Campaign, minDays: number): boolean {
+  if (minDays <= 0) return false;
+  const iso = c.start_time ?? c.created_time;
+  if (!iso) return false;
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return false;
+  const ageDays = (Date.now() - t) / 86_400_000;
+  return ageDays < minDays;
+}
+
 /**
  * Evaluate every active rule against the current account state.
  * Returns a list of triggers (without executing). Caller decides whether to execute.
@@ -159,12 +171,14 @@ async function evaluateRule(rule: AgentRule, contexts: CampaignContext[]): Promi
 
   switch (rule.rule_kind) {
     case 'pause_high_cpl': {
-      // params: { cpl_threshold_dollars: number, min_spend_dollars?: number, window?: 'today'|'yesterday'|'last_7d' }
+      // params: { cpl_threshold_dollars: number, min_spend_dollars?: number, window?: 'today'|'yesterday'|'last_7d', min_days_active?: number }
       const threshold = num(rule.params.cpl_threshold_dollars, 999);
       const minSpend = num(rule.params.min_spend_dollars, 50);
+      const minDays = num(rule.params.min_days_active, 3);
       const window = (rule.params.window as 'today' | 'yesterday' | 'last_7d') ?? 'last_7d';
 
       for (const c of contexts) {
+        if (tooYoung(c.campaign, minDays)) continue;
         const ins = c[window === 'today' ? 'today' : window === 'yesterday' ? 'yesterday' : 'last7d'];
         if (!ins) continue;
         const spend = num(ins.spend);
@@ -186,13 +200,15 @@ async function evaluateRule(rule: AgentRule, contexts: CampaignContext[]): Promi
     }
 
     case 'pause_zero_leads': {
-      // params: { min_spend_dollars: number, window?: 'today'|'yesterday' }
+      // params: { min_spend_dollars: number, window?: 'today'|'yesterday', min_days_active?: number }
       const minSpend = num(rule.params.min_spend_dollars, 100);
+      const minDays = num(rule.params.min_days_active, 3);
       const window = (rule.params.window as 'today' | 'yesterday') ?? 'today';
 
       for (const c of contexts) {
         const status = c.campaign.effective_status ?? c.campaign.status;
         if (status !== 'ACTIVE') continue;
+        if (tooYoung(c.campaign, minDays)) continue;
         const ins = c[window === 'today' ? 'today' : 'yesterday'];
         if (!ins) continue;
         const spend = num(ins.spend);
@@ -277,13 +293,25 @@ async function evaluateRule(rule: AgentRule, contexts: CampaignContext[]): Promi
       const projected = (totalToday / hoursIn) * 24;
 
       if (projected > cap) {
+        // Don't preferentially kill a learning-phase campaign just because
+        // its early CPL is high. Skip campaigns younger than min_days_active
+        // unless EVERY active campaign is in learning phase (then we have to
+        // pick something to keep total spend under cap).
+        const minDays = num(rule.params.min_days_active, 3);
         let worst: CampaignContext | null = null;
         let worstScore = -1;
+        const mature: CampaignContext[] = [];
+        const young: CampaignContext[] = [];
         for (const c of contexts) {
           const status = c.campaign.effective_status ?? c.campaign.status;
           if (status !== 'ACTIVE') continue;
           const spend = num(c.today?.spend);
           if (spend <= 0) continue;
+          (tooYoung(c.campaign, minDays) ? young : mature).push(c);
+        }
+        const pool = mature.length > 0 ? mature : young;
+        for (const c of pool) {
+          const spend = num(c.today?.spend);
           const leads = c.today ? extractLeads(c.today) : 0;
           // 0-lead campaigns penalized heavily; otherwise score by CPL
           const score = leads === 0 ? spend * 100 : spend / leads;
@@ -342,9 +370,9 @@ export async function seedDefaultRules(): Promise<number> {
   const defaults: Array<Parameters<typeof createRule>[0]> = [
     {
       name: 'Zero-lead kill switch',
-      description: 'Alert when a campaign spends $150+ today with 0 leads',
+      description: 'Alert when a campaign spends $150+ today with 0 leads (after day 3, post-learning)',
       rule_kind: 'pause_zero_leads',
-      params: { min_spend_dollars: 150, window: 'today' },
+      params: { min_spend_dollars: 150, window: 'today', min_days_active: 3 },
       auto_execute: false,
     },
     {
@@ -356,16 +384,16 @@ export async function seedDefaultRules(): Promise<number> {
     },
     {
       name: 'Burn rate circuit breaker',
-      description: 'Alert when projected daily spend exceeds $300 — targets worst performer',
+      description: 'Alert when projected daily spend exceeds $300 — targets worst mature performer',
       rule_kind: 'burn_rate_circuit_breaker',
-      params: { daily_cap_dollars: 300 },
+      params: { daily_cap_dollars: 300, min_days_active: 3 },
       auto_execute: false,
     },
     {
       name: 'High CPL alert',
-      description: '7-day CPL over $120 with $100+ spend',
+      description: '7-day CPL over $120 with $100+ spend (after day 3, post-learning)',
       rule_kind: 'pause_high_cpl',
-      params: { cpl_threshold_dollars: 120, min_spend_dollars: 100, window: 'last_7d' },
+      params: { cpl_threshold_dollars: 120, min_spend_dollars: 100, window: 'last_7d', min_days_active: 3 },
       auto_execute: false,
     },
     {

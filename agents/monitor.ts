@@ -22,6 +22,25 @@ import { getCreativePerformanceByAngle } from './creative.js';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ACCOUNT_TZ = process.env.ACCOUNT_TZ ?? 'America/Los_Angeles';
 
+// Age-awareness gate — Meta's conversion-optimization learning phase needs
+// ~50 events / ~7 days before performance data is statistically meaningful.
+// Suppress noisy alerts for campaigns younger than CAMPAIGN_MIN_AGE_DAYS
+// EXCEPT when spend has crossed EMERGENCY_SPEND_OVERRIDE — that's truly
+// excessive burn regardless of learning phase.
+const CAMPAIGN_MIN_AGE_DAYS = Number(process.env.CAMPAIGN_MIN_AGE_DAYS ?? 3);
+const EMERGENCY_SPEND_OVERRIDE = Number(process.env.EMERGENCY_SPEND_OVERRIDE ?? 300);
+
+function campaignAgeDays(c: Campaign): number | null {
+  // Prefer start_time (when the campaign actually started delivering) over
+  // created_time. A campaign created days ago but only just started delivering
+  // is effectively "new" from an optimization standpoint.
+  const iso = c.start_time ?? c.created_time;
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return null;
+  return (Date.now() - t) / 86_400_000;
+}
+
 if (!TELEGRAM_TOKEN) {
   throw new Error('TELEGRAM_BOT_TOKEN must be set for monitor');
 }
@@ -132,6 +151,13 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
     const status = c.campaign.effective_status ?? c.campaign.status;
     if (status !== 'ACTIVE') continue;
 
+    // Age gate: a freshly-started (or recently re-enabled) campaign is in
+    // Meta's learning phase. Spend-driven alerts often fire before the
+    // optimizer has enough events to stabilize. Skip those alerts unless
+    // spend has crossed the emergency threshold.
+    const ageDays = campaignAgeDays(c.campaign);
+    const inLearningWindow = ageDays != null && ageDays < CAMPAIGN_MIN_AGE_DAYS;
+
     const todaySpend = c.today?.spend ? Number(c.today.spend) : 0;
     const todayLeads = c.today ? extractLeads(c.today) : 0;
     const todayClicks = c.today?.clicks ? Number(c.today.clicks) : 0;
@@ -148,6 +174,20 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
     const wkCtr =
       wkImpr > 0 ? (wkClicks / wkImpr) * 100 : c.last7d?.ctr ? Number(c.last7d.ctr) : null;
 
+    // Age suffix for alert messages — gives the user signal-vs-noise context.
+    const ageSuffix =
+      ageDays == null
+        ? ''
+        : ageDays < CAMPAIGN_MIN_AGE_DAYS
+          ? ` | age ${ageDays.toFixed(1)}d (learning phase — usually noisy)`
+          : ageDays < 7
+            ? ` | age ${ageDays.toFixed(1)}d`
+            : '';
+
+    // Suppress noisy spend-driven alerts during learning window UNLESS spend
+    // has crossed the emergency override (truly excessive burn).
+    const skipNoisy = inLearningWindow && todaySpend < EMERGENCY_SPEND_OVERRIDE;
+
     const targetBase = {
       target_type: 'campaign' as const,
       target_id: c.campaign.id,
@@ -155,7 +195,7 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
     };
 
     // 1. CPL spike — today CPL > 1.5× 7d avg, only after $20 spent today.
-    if (todayCpl != null && wkCpl != null && todaySpend >= 20 && todayCpl > wkCpl * 1.5) {
+    if (!skipNoisy && todayCpl != null && wkCpl != null && todaySpend >= 20 && todayCpl > wkCpl * 1.5) {
       const ratio = todayCpl / wkCpl;
       const sev: Severity = ratio >= 2.5 ? 'critical' : ratio >= 2 ? 'alert' : 'notice';
       out.push({
@@ -165,7 +205,7 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
         current_value: todayCpl,
         baseline_value: wkCpl,
         delta_pct: ((todayCpl - wkCpl) / wkCpl) * 100,
-        message: `${c.campaign.name}: today CPL $${todayCpl.toFixed(0)} vs 7d $${wkCpl.toFixed(0)} (${ratio.toFixed(1)}×)`,
+        message: `${c.campaign.name}: today CPL $${todayCpl.toFixed(0)} vs 7d $${wkCpl.toFixed(0)} (${ratio.toFixed(1)}×)${ageSuffix}`,
         data: { today_spend: todaySpend, today_leads: todayLeads, week_spend: wkSpend, week_leads: wkLeads },
         recommended_action:
           ratio >= 2
@@ -179,7 +219,7 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
     }
 
     // 2. Zero leads with significant spend.
-    if (todayLeads === 0 && todaySpend >= 30) {
+    if (!skipNoisy && todayLeads === 0 && todaySpend >= 30) {
       const sev: Severity = todaySpend >= 100 ? 'critical' : todaySpend >= 50 ? 'alert' : 'notice';
       out.push({
         ...targetBase,
@@ -188,7 +228,7 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
         current_value: todaySpend,  // spend, not leads — so de-dup doubled-check is meaningful
         baseline_value: null,
         delta_pct: null,
-        message: `${c.campaign.name}: $${todaySpend.toFixed(0)} spent today, 0 leads`,
+        message: `${c.campaign.name}: $${todaySpend.toFixed(0)} spent today, 0 leads${ageSuffix}`,
         data: { today_spend: todaySpend, hours_in: hoursIn },
         recommended_action:
           todaySpend >= 100
@@ -202,7 +242,7 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
     }
 
     // 3. CTR drop — today < 60% of 7d avg.
-    if (todayCtr != null && wkCtr != null && wkCtr > 0.5 && todaySpend >= 15) {
+    if (!skipNoisy && todayCtr != null && wkCtr != null && wkCtr > 0.5 && todaySpend >= 15) {
       const ratio = todayCtr / wkCtr;
       if (ratio < 0.6) {
         const sev: Severity = ratio < 0.4 ? 'alert' : 'notice';
@@ -213,7 +253,7 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
           current_value: todayCtr,
           baseline_value: wkCtr,
           delta_pct: ((todayCtr - wkCtr) / wkCtr) * 100,
-          message: `${c.campaign.name}: CTR ${todayCtr.toFixed(2)}% vs 7d ${wkCtr.toFixed(2)}% (${(ratio * 100).toFixed(0)}% of normal)`,
+          message: `${c.campaign.name}: CTR ${todayCtr.toFixed(2)}% vs 7d ${wkCtr.toFixed(2)}% (${(ratio * 100).toFixed(0)}% of normal)${ageSuffix}`,
         });
       }
     }

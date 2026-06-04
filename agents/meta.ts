@@ -83,6 +83,8 @@ export interface Campaign {
   daily_budget?: string;       // smallest currency unit (cents in USD accounts)
   lifetime_budget?: string;
   budget_remaining?: string;
+  created_time?: string;       // ISO — when the campaign was first created
+  start_time?: string;         // ISO — when the campaign last started delivering
 }
 
 export interface CampaignInsight {
@@ -160,6 +162,8 @@ const CAMPAIGN_FIELDS = [
   'daily_budget',
   'lifetime_budget',
   'budget_remaining',
+  'created_time',
+  'start_time',
 ].join(',');
 
 const INSIGHT_FIELDS = [
