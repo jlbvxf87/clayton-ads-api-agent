@@ -88,6 +88,8 @@ import {
   listCreativeTags,
   formatTagSummary,
   getCreativePerformanceByAngle,
+  auditCreative,
+  formatPolicyAudit,
 } from './creative.js';
 import {
   runCohortTick,
@@ -1486,6 +1488,17 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'audit_creative',
+    description: "PRE-LAUNCH POLICY CHECK. Run Claude vision on an existing ad to predict whether Meta's automated review will reject it for the 'Drugs and Pharmaceutical Products' policy. Returns verdict (PASS / AT_RISK / WILL_REJECT) + confidence + specific risks found (vials, syringes, brand drug names, weight numbers, personal attribute violations) + actionable fixes per risk. **Always run this on any new Claya creative before flipping it ACTIVE** — costs ~$0.01 vs $X spend on a campaign that gets shut down. Also useful post-rejection to learn the specific trigger. For batches of 5+, wrap in batch_execute.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        ad_id: { type: 'string', description: 'Meta ad ID' },
+      },
+      required: ['ad_id'],
+    },
+  },
+  {
     name: 'get_insights_breakdown',
     description: "Pull performance metrics broken down by ONE OR MORE dimensions. The single highest-value diagnostic — answers 'which placement converts best?' / 'which age segment is driving spend?' / 'are we losing money on Audience Network?' / 'what hours of the day perform?'. Returns spend, impressions, clicks, CTR, CPM, CPC, reach, frequency, actions[] per dimension combination. Available breakdown dims: 'age', 'gender', 'country', 'region', 'dma', 'impression_device', 'device_platform', 'publisher_platform', 'platform_position', 'hourly_stats_aggregated_by_advertiser_time_zone'. Pass 1-2 dims; passing 3+ explodes row count.",
     input_schema: {
@@ -2371,6 +2384,29 @@ async function dispatchTool(
       const result = await deleteCustomAudience(audienceId);
       await logAgentAction(chatId, 'delete_custom_audience', audienceId, aud?.name ?? null, aud ?? null, result);
       return { ...result, deleted_name: aud?.name ?? null };
+    }
+    case 'audit_creative': {
+      const adId = input.ad_id as string;
+      const ad = await getAd(adId);
+      const cr = (ad as unknown as { creative?: { id?: string; body?: string; title?: string; image_url?: string; thumbnail_url?: string } }).creative ?? {};
+      // If the ad object didn't include creative fields, fetch the creative directly
+      let creative = cr;
+      if (!creative.image_url && !creative.thumbnail_url && !creative.body) {
+        try {
+          const adFull = await fetch(
+            `https://graph.facebook.com/v25.0/${adId}?fields=creative{id,body,title,image_url,thumbnail_url}&access_token=${process.env.META_ACCESS_TOKEN}`,
+          ).then((r) => r.json() as Promise<{ creative?: typeof creative }>);
+          if (adFull.creative) creative = adFull.creative;
+        } catch {}
+      }
+      const result = await auditCreative({
+        id: adId,
+        name: (ad as unknown as { name?: string }).name,
+        body: creative.body,
+        title: creative.title,
+        image_url: creative.image_url ?? creative.thumbnail_url,
+      });
+      return result;
     }
     case 'get_insights_breakdown': {
       const level = input.level as 'account' | 'campaign' | 'adset' | 'ad';
@@ -3637,6 +3673,43 @@ async function logAgentAction(
   }
 }
 
+// ---------- /audit — pre-launch policy vision check ----------
+
+async function handleAuditCmd(chatId: number, args: string): Promise<void> {
+  const adId = args.trim();
+  if (!adId) {
+    await bot.sendMessage(
+      chatId,
+      'Usage: /audit <ad_id>\n\nRuns Claude vision on the ad creative and predicts whether Meta will reject it for the Drugs/Pharma policy. Returns verdict + specific risks + actionable fixes. Use BEFORE flipping an ad ACTIVE.',
+    );
+    return;
+  }
+  await bot.sendMessage(chatId, `Auditing ad ${adId}…`);
+  try {
+    const ad = await getAd(adId);
+    const cr = (ad as unknown as { creative?: { body?: string; title?: string; image_url?: string; thumbnail_url?: string } }).creative ?? {};
+    let creative = cr;
+    if (!creative.image_url && !creative.thumbnail_url && !creative.body) {
+      try {
+        const url = `https://graph.facebook.com/v25.0/${adId}?fields=creative{id,body,title,image_url,thumbnail_url}&access_token=${process.env.META_ACCESS_TOKEN}`;
+        const adFull = (await fetch(url).then((r) => r.json())) as { creative?: typeof creative };
+        if (adFull.creative) creative = adFull.creative;
+      } catch {}
+    }
+    const result = await auditCreative({
+      id: adId,
+      name: (ad as unknown as { name?: string }).name,
+      body: creative.body,
+      title: creative.title,
+      image_url: creative.image_url ?? creative.thumbnail_url,
+    });
+    await sendChunked(chatId, formatPolicyAudit(result));
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    await bot.sendMessage(chatId, `Audit failed: ${m}`);
+  }
+}
+
 // ---------- /audiences — Meta custom + lookalike audiences ----------
 
 async function handleAudiencesCmd(
@@ -4415,6 +4488,7 @@ bot.on('message', async (msg) => {
               'Creative intelligence:',
               '/tag <ad> — auto-tag an ad (hook type, emotional angle, format, claim)',
               '/tag stats — breakdown of tagged ads by emotional angle',
+              '/audit <ad_id> — pre-launch Meta policy check via Claude vision (catches drugs/pharma rejections before they happen)',
               '',
               'Autonomous rules:',
               '/rules — list active rules and trigger history',
@@ -5113,6 +5187,9 @@ bot.on('message', async (msg) => {
         case 'audiences':
         case 'audience':
           await handleAudiencesCmd(chatId, userKey, args);
+          return;
+        case 'audit':
+          await handleAuditCmd(chatId, args);
           return;
         case 'grant':
           await handleGrantCmd(chatId, userKey, args);
