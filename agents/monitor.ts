@@ -4,18 +4,13 @@ import { supabase } from './supabase.js';
 import {
   listCampaigns,
   getCampaignInsights,
-  pauseCampaign,
   extractLeads,
   extractFunnelSteps,
   CLAYA_FUNNEL_STEPS,
   type Campaign,
   type CampaignInsight,
 } from './meta.js';
-import {
-  requirePermission,
-  recordPermissionUsage,
-  type PermissionKind,
-} from './permissions.js';
+import { type PermissionKind } from './permissions.js';
 import { runJudgmentOnSignal, formatJudgmentForTelegram } from './judgment.js';
 import { getCreativePerformanceByAngle } from './creative.js';
 
@@ -299,7 +294,8 @@ export function detectSignals(contexts: CampaignContext[]): DetectedSignal[] {
             delta_pct: ctrDecay * 100,
             message: `${c.campaign.name}: frequency ${todayFreq.toFixed(1)}, CTR down ${(ctrDecay * 100).toFixed(0)}% vs 7d avg — ~${daysLeft}d before fatigue. Queue creative variants now.`,
             data: { frequency: todayFreq, ctr_today: todayCtrVal, ctr_7d: wkCtrVal, days_left: daysLeft },
-            // At alert (≥3.5 freq), standing order can auto-pause + trigger replacement brief
+            // At alert (≥3.5 freq) we attach a pause recommendation; the user
+            // decides. The surfaced alert also carries a creative replacement brief.
             recommended_action: fatigueSev === 'alert'
               ? {
                   kind: 'pause' as PermissionKind,
@@ -438,55 +434,12 @@ async function autoResolveSignalsThatStopped(active: DetectedSignal[]): Promise<
 
 // ---------- Auto-act when a standing order covers a recommended action ----------
 
-async function attemptAutoAction(
-  inboxId: number,
-  sig: DetectedSignal,
-): Promise<{ acted: boolean; permId?: number; emergency?: boolean; error?: string }> {
-  if (!sig.recommended_action) return { acted: false };
-
-  // Auto-pause is DISABLED — Clayton alerts only, never acts without explicit user command.
-  // All writes require user permission via /pause or /grant standing order.
-
-  const guard = await requirePermission(sig.recommended_action.kind, {
-    campaign_id: sig.recommended_action.params.campaign_id,
-    campaign_name: sig.recommended_action.params.campaign_name,
-  });
-  if (!guard.ok) return { acted: false };
-
-  try {
-    if (sig.recommended_action.tool === 'pause_campaign') {
-      await pauseCampaign(sig.recommended_action.params.campaign_id);
-    }
-    await recordPermissionUsage(guard.permission_id);
-    await supabase
-      .from('agent_actions')
-      .insert({
-        chat_id: null,
-        user_handle: 'monitor',
-        command: `auto:${sig.recommended_action.tool}`,
-        target_campaign_id: sig.recommended_action.params.campaign_id,
-        target_campaign_name: sig.recommended_action.params.campaign_name,
-        before_state: { signal_kind: sig.signal_kind, current: sig.current_value, baseline: sig.baseline_value },
-        success: true,
-        permission_id: guard.permission_id,
-      });
-    await supabase
-      .from('agent_inbox')
-      .update({
-        resolved_at: new Date().toISOString(),
-        resolved_by: `auto:permission_${guard.permission_id}`,
-        resolution_note: `auto-paused under standing order #${guard.permission_id}`,
-        auto_action_taken: true,
-        auto_action_permission_id: guard.permission_id,
-      })
-      .eq('id', inboxId);
-    return { acted: true, permId: guard.permission_id };
-  } catch (err) {
-    const m = err instanceof Error ? err.message : String(err);
-    console.error(`[MONITOR] auto action ${sig.recommended_action.tool} failed:`, m);
-    return { acted: false, error: m };
-  }
-}
+// ALERT-ONLY BY DESIGN. The monitor NEVER pauses anything on its own — not
+// even under a standing /grant, and not on emergency spend. It detects signals
+// and surfaces them to Telegram; the human decides and runs /pause (or confirms
+// a Clayton tool call). This is a deliberate manual-control guarantee: no
+// autonomous spend action, ever. (Prior versions had a grant-gated auto-pause
+// and a never-wired "emergency pause" branch — both removed 2026-07-03.)
 
 // ---------- Telegram surfacing ----------
 
@@ -532,30 +485,10 @@ async function buildCreativeSuggestion(): Promise<string | null> {
 async function surfaceItem(
   inboxId: number,
   sig: DetectedSignal,
-  autoActed: { acted: boolean; permId?: number; emergency?: boolean; error?: string },
   tickJudgmentBudget: { remaining: number },
 ): Promise<void> {
-  if (autoActed.acted) {
-    let text = autoActed.emergency
-      ? `[EMERGENCY PAUSED] ${sig.message}\nSpend exceeded $300 with 0 leads — paused automatically. Check pixel/funnel before re-activating.`
-      : `${SEVERITY_PREFIX[sig.severity]} auto-resolved: ${sig.message}\nStanding order #${autoActed.permId} covered this — paused automatically.`;
-    // Phase 5: creative fatigue auto-pause appends a replacement brief
-    if (sig.signal_kind === 'creative_fatigue_warning') {
-      const suggestion = await buildCreativeSuggestion();
-      if (suggestion) text += `\n\n${suggestion}`;
-    }
-    // Mark surfaced_at before sending so cooldown holds even if Telegram fails.
-    const { error: markErr } = await supabase
-      .from('agent_inbox')
-      .update({ surfaced_to_telegram: true, surfaced_at: new Date().toISOString() })
-      .eq('id', inboxId);
-    if (markErr) console.error('[MONITOR] surfaced_at update failed (auto-act):', markErr.message);
-    await notifyTelegram(text);
-    return;
-  }
-
-  // Non-auto-act path. For alert/critical with budget remaining, run the
-  // judgment loop and surface its rich output. Otherwise canned message.
+  // Alert-only. For alert/critical with budget remaining, run the judgment
+  // loop and surface its rich output. Otherwise canned message.
   let text: string;
   if (
     (sig.severity === 'critical' || sig.severity === 'alert') &&
@@ -565,12 +498,9 @@ async function surfaceItem(
     try {
       const r = await runJudgmentOnSignal(inboxId);
       if ('error' in r) {
-        text = canonicalSurfaceText(inboxId, sig, autoActed.error);
+        text = canonicalSurfaceText(inboxId, sig);
       } else {
         text = formatJudgmentForTelegram(r.judgment, sig.severity);
-        if (autoActed.error) {
-          text += `\n\n⚠️ Auto-pause attempted but failed: ${autoActed.error}`;
-        }
         await supabase
           .from('agent_judgments')
           .update({ surfaced_to_telegram: true, surfaced_at: new Date().toISOString() })
@@ -578,10 +508,17 @@ async function surfaceItem(
       }
     } catch (err) {
       console.error('[MONITOR] judgment loop failed:', err);
-      text = canonicalSurfaceText(inboxId, sig, autoActed.error);
+      text = canonicalSurfaceText(inboxId, sig);
     }
   } else {
-    text = canonicalSurfaceText(inboxId, sig, autoActed.error);
+    text = canonicalSurfaceText(inboxId, sig);
+  }
+
+  // Creative-fatigue alerts carry a replacement brief so the user has the next
+  // step in hand when they decide to pause. (Enriches the alert — no auto-act.)
+  if (sig.signal_kind === 'creative_fatigue_warning') {
+    const suggestion = await buildCreativeSuggestion();
+    if (suggestion) text += `\n\n${suggestion}`;
   }
 
   // Mark surfaced_at before sending so cooldown holds even if Telegram fails.
@@ -593,27 +530,15 @@ async function surfaceItem(
   await notifyTelegram(text);
 }
 
-function canonicalSurfaceText(inboxId: number, sig: DetectedSignal, autoActError?: string): string {
+function canonicalSurfaceText(inboxId: number, sig: DetectedSignal): string {
   const lines: string[] = [];
   lines.push(`${SEVERITY_PREFIX[sig.severity]} ${sig.message}`);
 
-  if (autoActError) {
-    lines.push(`⚠️ Auto-pause attempted but failed: ${autoActError}`);
-    if (sig.recommended_action) {
-      lines.push(
-        `  Manual: /pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}`,
-      );
-    }
-  } else if (sig.recommended_action) {
-    lines.push(
-      `Suggested: pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}.`,
-    );
-    lines.push(
-      `  Authorize once: /pause ${sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id}`,
-    );
-    lines.push(
-      `  Authorize ongoing: /grant pause campaign="${sig.recommended_action.params.campaign_name}" expires=24h`,
-    );
+  if (sig.recommended_action) {
+    const target =
+      sig.recommended_action.params.campaign_name ?? sig.recommended_action.params.campaign_id;
+    lines.push(`Suggested: pause ${target}.`);
+    lines.push(`  To pause: /pause ${target}`);
   }
   lines.push(`(/inbox to see all open items, /inbox resolve ${inboxId} to dismiss)`);
   return lines.join('\n');
@@ -669,7 +594,6 @@ export async function runMonitorTick(): Promise<{
 
   let newInbox = 0;
   let surfaced = 0;
-  let autoActed = 0;
   const tickJudgmentBudget = { remaining: JUDGMENT_PER_TICK_CAP };
 
   for (const sig of signals) {
@@ -677,25 +601,16 @@ export async function runMonitorTick(): Promise<{
     if (!up) continue;
     if (up.isNew) newInbox++;
 
-    // Try auto-act on every detection (even pre-existing rows) — a standing order
-    // grant after the row was opened should still close it on the next tick.
-    const autoActResult = await attemptAutoAction(up.id, sig);
-    if (autoActResult.acted) {
-      autoActed++;
-      await surfaceItem(up.id, sig, autoActResult, tickJudgmentBudget);
-      surfaced++;
-      continue;
-    }
-
+    // Alert-only: surface to Telegram if due. Never auto-act.
     if (shouldSurface(sig, up.isNew, up.lastSurfacedAt, up.lastSurfacedValue)) {
-      await surfaceItem(up.id, sig, autoActResult, tickJudgmentBudget);
+      await surfaceItem(up.id, sig, tickJudgmentBudget);
       surfaced++;
     }
   }
 
   const autoResolvedOpen = await autoResolveSignalsThatStopped(signals);
 
-  return { detected: signals.length, new_inbox: newInbox, surfaced, auto_resolved_open: autoResolvedOpen, auto_acted: autoActed };
+  return { detected: signals.length, new_inbox: newInbox, surfaced, auto_resolved_open: autoResolvedOpen, auto_acted: 0 };
 }
 
 // ---------- Inbox queries ----------

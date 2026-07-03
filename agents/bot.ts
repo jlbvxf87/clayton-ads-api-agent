@@ -1319,6 +1319,19 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'set_daily_budget',
+    description: "Set ONE campaign's (CBO) daily budget by ID. Takes daily_budget_dollars (whole dollars, e.g. 80 = $80/day). Audit-logged and GATED by the 'budget' permission: without a standing /grant it stages a SINGLE confirmation — one 'yes' executes, exactly like pause. This is the direct budget tool — when a user asks in plain English to change one campaign's budget, CALL THIS; do NOT bounce them to the /budget slash command. Hard rails always enforced: $5/day floor, $500/day cap, and a ±50% per-action change limit (bigger swings must be split into two steps). For multi-campaign budget shifts use propose_rebalance instead. Budget lives at the campaign (CBO) or ad-set level — not the ad level.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        campaign_id: { type: 'string' },
+        daily_budget_dollars: { type: 'number', description: 'New daily budget in whole dollars (e.g. 80 = $80/day).' },
+        campaign_name: { type: 'string', description: 'Optional campaign name — used in the confirmation prompt and audit label.' },
+      },
+      required: ['campaign_id', 'daily_budget_dollars'],
+    },
+  },
+  {
     name: 'clone_ad_with_new_copy',
     description: "Clone an existing ad with new headline / body / CTA / link URL, save the new ad as PAUSED. The original is untouched. Use for A/B testing copy variants. Always returns the new ad ID so the user can publish from Ads Manager when ready. NEVER touches active ads — the new ad is always paused.",
     input_schema: {
@@ -1646,7 +1659,7 @@ const CUSTOM_TOOLS: Anthropic.Tool[] = [
       properties: {
         tool: {
           type: 'string',
-          description: "Name of the inner tool to invoke N times. Must be an existing tool the agent has (create_ad, pause_campaign, set_daily_budget, delete_custom_audience, create_lookalike_audience, etc).",
+          description: "Name of the inner tool to invoke N times. Must be an existing tool the agent has (create_ad, pause_campaign, set_ad_status, set_daily_budget, delete_custom_audience, create_lookalike_audience, etc). For a single campaign's budget prefer the direct set_daily_budget tool; for many campaigns at once use propose_rebalance, not a batch of budget changes.",
         },
         inputs: {
           type: 'array',
@@ -2239,6 +2252,31 @@ async function dispatchTool(
       const resp = await setAdStatus(id, status);
       await logAgentAction(chatId, `set_ad_status:${status}`, id, null, null, resp);
       return { updated: true, response: resp };
+    }
+    case 'set_daily_budget': {
+      const cid = input.campaign_id as string;
+      const dollars = Number(input.daily_budget_dollars);
+      if (!Number.isFinite(dollars) || dollars <= 0) {
+        throw new Error('daily_budget_dollars must be a positive number.');
+      }
+      const newCents = Math.round(dollars * 100);
+      // Hard rails — mirror the /budget slash command and the creation floor/cap.
+      if (newCents < 500) throw new Error('Budget below the $5/day floor.');
+      if (newCents > 50_000) throw new Error('Budget exceeds the $500/day per-action cap.');
+      const before = await getCampaign(cid).catch(() => null);
+      const oldCents = before?.daily_budget ? Number(before.daily_budget) : null;
+      if (oldCents != null && oldCents > 0) {
+        const ratio = newCents / oldCents;
+        if (ratio > 1.5 || ratio < 0.5) {
+          throw new Error(
+            `Change is ${(ratio * 100 - 100).toFixed(0)}% — exceeds the ±50% per-action cap. Do it in two steps.`,
+          );
+        }
+      }
+      const resp = await setDailyBudget(cid, newCents);
+      const after = await getCampaign(cid).catch(() => null);
+      await logAgentAction(chatId, 'set_daily_budget', cid, before?.name ?? null, before, after);
+      return { updated: true, old_daily_cents: oldCents, new_daily_cents: newCents, response: resp };
     }
     case 'clone_ad_with_new_copy': {
       const result = await cloneAdWithNewCopy({
@@ -3444,6 +3482,21 @@ const WRITE_TOOL_SPECS: Record<string, WriteToolSpec> = {
     permKind: (i) => (i.status === 'ACTIVE' ? 'resume' : 'pause'),
     paramsFor: () => ({}),
     targetLabel: (i) => `set ad ${i.ad_id} → ${i.status}`,
+  },
+  set_daily_budget: {
+    permKind: () => 'budget',
+    // Pass the absolute new budget so a standing /grant's daily ceiling is
+    // enforced. delta_pct needs the old budget (async) so it isn't computed
+    // here — the ±50% hard rail in the dispatch case covers oversize swings.
+    paramsFor: (i) => ({
+      campaign_id: i.campaign_id ? String(i.campaign_id) : null,
+      campaign_name: typeof i.campaign_name === 'string' ? i.campaign_name : null,
+      new_daily_budget_cents: Number.isFinite(Number(i.daily_budget_dollars))
+        ? Math.round(Number(i.daily_budget_dollars) * 100)
+        : null,
+    }),
+    targetLabel: (i) =>
+      `set ${typeof i.campaign_name === 'string' ? '"' + i.campaign_name + '"' : 'campaign ' + i.campaign_id} daily budget to $${Number(i.daily_budget_dollars)}/day`,
   },
   clone_ad_with_new_copy: {
     permKind: () => 'clone_ad',
