@@ -1007,11 +1007,18 @@ async function executePending(
         typeof result === 'object' && result !== null
           ? JSON.stringify(result).slice(0, 600)
           : String(result);
-      await bot.sendMessage(chatId, `Done — ${action.targetLabel}.\n${summary}`);
+      const doneMsg = `Done — ${action.targetLabel}.\n${summary}`;
+      await bot.sendMessage(chatId, doneMsg);
+      // Write the outcome back into conversation memory so a later "what did
+      // you do?" is narrated from history instead of re-emitting the same tool
+      // calls (which would re-stage a duplicate confirmation prompt).
+      await recordMessage(chatId, 'assistant', `[action executed] ${doneMsg}`);
       return { ok: true };
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
-      await bot.sendMessage(chatId, `Failed to ${action.targetLabel}: ${m}`);
+      const failMsg = `Failed to ${action.targetLabel}: ${m}`;
+      await bot.sendMessage(chatId, failMsg);
+      await recordMessage(chatId, 'assistant', `[action failed] ${failMsg}`);
       return { ok: false, error: m };
     }
   }
@@ -1099,6 +1106,7 @@ async function executePending(
             ? `Set ${action.campaignName} daily budget to ${fmtMoney(action.newDailyBudgetCents)}.`
             : `Boosted ${action.campaignName} by ${action.percent}%: ${fmtMoney(action.oldDailyBudgetCents)} -> ${fmtMoney(action.newDailyBudgetCents)}.`;
     await bot.sendMessage(chatId, summary);
+    await recordMessage(chatId, 'assistant', `[action executed] ${summary}`);
     return { ok: true };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -1113,6 +1121,7 @@ async function executePending(
       .eq('id', audit.id);
     const detail = fbBody ? `\n${JSON.stringify(fbBody).slice(0, 800)}` : '';
     await bot.sendMessage(chatId, `Meta API error:\n${errMsg}${detail}`);
+    await recordMessage(chatId, 'assistant', `[action failed] ${action.kind} ${action.campaignName ?? ''}: ${errMsg}`);
     return { ok: false, error: errMsg };
   }
 }
@@ -2249,9 +2258,25 @@ async function dispatchTool(
     case 'set_ad_status': {
       const id = input.ad_id as string;
       const status = input.status as 'ACTIVE' | 'PAUSED';
-      const resp = await setAdStatus(id, status);
-      await logAgentAction(chatId, `set_ad_status:${status}`, id, null, null, resp);
-      return { updated: true, response: resp };
+      try {
+        const resp = await setAdStatus(id, status);
+        await logAgentAction(chatId, `set_ad_status:${status}`, id, null, null, resp);
+        return { updated: true, response: resp };
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        // Meta re-validates an ad's creative on ANY ad-level update — even a
+        // pause. If the ad's underlying page post was deleted/hidden, it rejects
+        // with #100 subcode 2446289. Pausing the PARENT (ad set / campaign)
+        // skips that check, so surface those IDs as the actionable fallback.
+        if (/2446289|post you selected for your ad is not available/i.test(m)) {
+          const parent = await getAd(id).catch(() => null);
+          const parentHint = parent
+            ? ` Its post was deleted, so Meta blocks any ad-level change. Pause the parent instead — ad set ${parent.adset_id ?? '?'} (set_ad_set_status PAUSED) or campaign ${parent.campaign_id ?? '?'} (pause_campaign).`
+            : ' Its post was deleted, so Meta blocks any ad-level change. Pause the parent ad set or campaign instead — that skips the broken-creative check.';
+          throw new Error(`Can't ${status === 'PAUSED' ? 'pause' : 'update'} ad ${id}:${parentHint}`);
+        }
+        throw err;
+      }
     }
     case 'set_daily_budget': {
       const cid = input.campaign_id as string;
