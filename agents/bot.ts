@@ -2573,6 +2573,10 @@ async function dispatchTool(
             const m = err instanceof Error ? err.message : String(err);
             outcomes[i] = { index: i, ok: false, error: m };
           }
+          // Deliberate pacing between calls per worker: a large batch should not
+          // fire as fast as the API responds. With concurrency ≤5 this caps the
+          // write rate well under Meta's ceiling and avoids a bursty pattern.
+          if (nextIdx < items.length) await new Promise((r) => setTimeout(r, 200));
         }
       }
       await Promise.all(Array.from({ length: concurrency }, () => worker()));

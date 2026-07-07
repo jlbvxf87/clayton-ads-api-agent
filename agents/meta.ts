@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import axios, { type AxiosInstance } from 'axios';
+import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from 'axios';
 
 const ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const AD_ACCOUNT_RAW = process.env.META_AD_ACCOUNT;
@@ -56,10 +56,39 @@ export class MetaApiError extends Error {
   }
 }
 
+// Meta rate-limit / throttle error codes. We retry ONLY these — a throttle is
+// transient, so a bounded backoff self-heals brief spikes AND paces us back
+// under Meta's ceiling instead of hammering (which is the pattern that trips
+// bot-fraud detection). A policy/validation error (e.g. the deleted-post
+// #100.2446289) is NOT retried — that honors guardrail #10 (don't auto-retry
+// real failures), it just fails and surfaces immediately.
+const THROTTLE_CODES = new Set([4, 17, 32, 613]);
+function isThrottle(code: number | undefined, status: number | undefined): boolean {
+  if (status === 429) return true;
+  if (code == null) return false;
+  return THROTTLE_CODES.has(code) || (code >= 80000 && code <= 80006); // 80xxx = Business-Use-Case rate limits
+}
+const MAX_META_RETRIES = 3;
+const throttleSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 meta.interceptors.response.use(
   (resp) => resp,
-  (err) => {
+  async (err) => {
     const body = err?.response?.data?.error;
+    const status = err?.response?.status as number | undefined;
+    const cfg = err?.config as (InternalAxiosRequestConfig & { __retryCount?: number }) | undefined;
+
+    // Bounded exponential backoff + jitter on genuine throttle responses only.
+    if (cfg && isThrottle(body?.code, status)) {
+      cfg.__retryCount = (cfg.__retryCount ?? 0) + 1;
+      if (cfg.__retryCount <= MAX_META_RETRIES) {
+        const base = Math.min(15_000, 1_500 * 2 ** (cfg.__retryCount - 1));
+        const jitter = Math.floor(base * 0.25 * Math.random());
+        await throttleSleep(base + jitter);
+        return meta.request(cfg);
+      }
+    }
+
     if (body) {
       const codePart = body.code != null ? `#${body.code}${body.error_subcode ? `.${body.error_subcode}` : ''}` : '';
       const msg = `Meta ${codePart}: ${body.message ?? 'unknown error'}${body.error_user_msg ? ` — ${body.error_user_msg}` : ''}`;
@@ -67,7 +96,7 @@ meta.interceptors.response.use(
         code: body.code,
         subcode: body.error_subcode,
         fbtrace_id: body.fbtrace_id,
-        status: err.response?.status,
+        status,
       });
     }
     throw err;
